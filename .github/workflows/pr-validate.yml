@@ -1,0 +1,35 @@
+name: validate-source-archive
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Reconstruct source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/part* | base64 -d > /tmp/venture.zip
+          unzip -t /tmp/venture.zip
+          mkdir -p /tmp/venture
+          unzip -q /tmp/venture.zip -d /tmp/venture
+          test -f /tmp/venture/app/engine.py
+          test -f /tmp/venture/app/agent.py
+          test -f /tmp/venture/web/index.html
+      - name: Install
+        working-directory: /tmp/venture
+        run: uv sync --extra dev
+      - name: Lint
+        working-directory: /tmp/venture
+        run: uv run ruff check app tests
+      - name: Test
+        working-directory: /tmp/venture
+        run: uv run pytest --cov=app --cov-report=term-missing
