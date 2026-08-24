@@ -1,0 +1,60 @@
+name: bootstrap-source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".bootstrap/**"
+      - ".github/workflows/bootstrap.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Reconstruct tested source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/part* | base64 -d > /tmp/venture.zip
+          unzip -t /tmp/venture.zip
+          rm -rf /tmp/venture
+          mkdir -p /tmp/venture
+          unzip -q /tmp/venture.zip -d /tmp/venture
+          test -f /tmp/venture/app/engine.py
+          test -f /tmp/venture/app/agent.py
+          test -f /tmp/venture/pyproject.toml
+          test -f /tmp/venture/.github/workflows/test.yml
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude '.bootstrap/' \
+            --exclude '.github/workflows/bootstrap.yml' \
+            /tmp/venture/ ./
+
+      - name: Install exact project dependencies
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check app tests
+
+      - name: Test
+        run: uv run pytest --cov=app --cov-report=term-missing
+
+      - name: Commit only after validation passes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .bootstrap
+          rm -f .github/workflows/bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Import tested Venture Twin MVP"
+          git push
