@@ -5,6 +5,7 @@ on:
     branches: [flagship/global-agent]
     paths:
       - 'app/**'
+      - 'scripts/live_adk_proof.py'
       - 'tests/**'
       - 'agents-cli-manifest.yaml'
       - '.github/workflows/live-agent.yml'
@@ -47,88 +48,18 @@ jobs:
           test -n "$DATABASE_URL"
           uv sync --extra dev --python 3.13
           uv run pytest
-          uvx google-agents-cli --help >/tmp/agents-cli-help.txt
-          grep -q 'run' /tmp/agents-cli-help.txt
 
-      - name: Run actual Google ADK Cogen agent on Austin coffee-shop venture
-        id: agent
+      - name: Run actual Google ADK Runner on Austin coffee-shop venture
         shell: bash
         run: |
           set -euo pipefail
-          PROMPT="I have USD 85,000 and want to open a specialty coffee shop in Austin, Texas, United States. Treat Austin as the locality, Texas as the state/subdivision, United States as the country, and model every monetary value in USD. I must keep USD 15,000 untouched as protected reserve. No debt is available. I need the business eventually to pay me USD 7,500 per month. I am a first-time cafe operator working full-time. I will not accept losing more than USD 30,000, and I want to launch within 6 months. Use your Cogen tools now: persist this as a Venture Twin, perform current evidence-grounded underwriting for Austin/Texas/US, attack the idea rather than flatter it, do not invent any missing fact, and tell me what can kill it and whether I should commit capital. Do not stop at a generic business plan."
-
-          uvx google-agents-cli run -v "$PROMPT" 2>&1 | tee /tmp/cogen-adk-trace.txt
-
-          echo '--- ASSERT ROOT AGENT USED COGEN TOOLS ---'
-          grep -q 'create_venture' /tmp/cogen-adk-trace.txt
-          grep -q 'run_underwriting' /tmp/cogen-adk-trace.txt
-          echo 'ADK_ROOT_TOOL_CALLS_CONFIRMED'
-
-      - name: Prove the ADK run persisted and underwrote the US Venture Twin in Neon
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run python - <<'PY' | tee /tmp/cogen-neon-proof.txt
-          import json
-          from app.runtime import get_service
-
-          service = get_service()
-          ventures = [
-              venture for venture in service.list_ventures()
-              if venture.intake.country == 'United States'
-              and venture.intake.currency == 'USD'
-              and 'Austin' in venture.intake.location
-          ]
-          if not ventures:
-              raise SystemExit('ADK run did not persist an Austin/US/USD Venture Twin')
-
-          venture = max(ventures, key=lambda item: item.created_at)
-          units = [item.unit or '' for item in venture.assumptions]
-          evidence_text = json.dumps([item.model_dump(mode='json') for item in venture.evidence], default=str).lower()
-          specialists = service.specialists(venture.id)
-          events = service.events(venture.id)
-          validation = service.validation_tasks(venture.id)
-          result = venture.underwriting
-
-          if any('KES' in unit for unit in units):
-              raise SystemExit('Country leak: KES appeared in US venture assumptions')
-          if 'kenya' in evidence_text or 'kra' in evidence_text:
-              raise SystemExit('Country leak: Kenyan evidence appeared in US venture')
-          if result is None:
-              raise SystemExit('ADK run created venture but did not underwrite it')
-
-          roles = sorted({item.role.value for item in specialists})
-          expected_roles = {'finance', 'market', 'regulatory', 'execution', 'adversary'}
-          if set(roles) != expected_roles:
-              raise SystemExit(f'Expected all five specialist roles, got {roles}')
-
-          print('LIVE_ADK_NEON_PROOF_PASS')
-          print('venture_id=', venture.id)
-          print('idea=', venture.intake.idea)
-          print('location=', venture.intake.location)
-          print('country=', venture.intake.country)
-          print('subdivision=', venture.intake.subdivision)
-          print('currency=', venture.intake.currency)
-          print('decision=', result.decision.value)
-          print('simulation_runs=', result.simulation_runs)
-          print('evidence_count=', len(venture.evidence))
-          print('evidence_coverage=', result.evidence_coverage)
-          print('model_confidence=', result.model_confidence.value)
-          print('critical_unknowns=', result.critical_unknowns)
-          print('biggest_risks=', result.biggest_risks)
-          print('specialist_roles=', roles)
-          print('validation_tasks=', [item.title for item in validation])
-          print('event_types=', [item.event_type.value for item in events])
-          print('source_urls=', [str(item.source_url) for item in venture.evidence if item.source_url][:20])
-          PY
+          uv run python scripts/live_adk_proof.py 2>&1 | tee /tmp/cogen-adk-proof.txt
 
       - name: Upload agent proof trace
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cogen-live-adk-proof
-          path: |
-            /tmp/cogen-adk-trace.txt
-            /tmp/cogen-neon-proof.txt
+          path: /tmp/cogen-adk-proof.txt
           if-no-files-found: warn
           retention-days: 7
