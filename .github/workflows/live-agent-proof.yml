@@ -1,0 +1,205 @@
+name: live-agent-proof
+
+on:
+  push:
+    branches: [flagship/global-agent-proof]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  austin-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APP_ENV: proof
+      DATABASE_BACKEND: postgres
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-3.7-flash
+      RESEARCH_MODE: live
+      GOOGLE_CLOUD_PROJECT: cogen-506607
+      GOOGLE_CLOUD_LOCATION: us-central1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install Cogen and Google Agents CLI
+        run: |
+          uv sync --extra dev --python 3.13
+          uv tool install google-agents-cli
+          agents-cli --version
+          agents-cli cmd-info --json
+
+      - name: Verify live credentials exist without printing them
+        run: |
+          python - <<'PY'
+          import os
+          missing = [name for name in ("DATABASE_URL", "GEMINI_API_KEY") if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Missing required proof secrets: " + ", ".join(missing))
+          print("LIVE_PROOF_SECRETS_PRESENT")
+          PY
+
+      - name: Snapshot venture IDs before the agent run
+        run: |
+          mkdir -p artifacts
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          from app.runtime import get_service
+          service = get_service()
+          ids = [item.id for item in service.list_ventures()]
+          Path("artifacts/before-venture-ids.json").write_text(json.dumps(ids, indent=2))
+          print("existing_ventures=", len(ids))
+          PY
+
+      - name: Run the real Google ADK root agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROMPT=$(cat <<'PROMPT'
+          I am a first-time hospitality founder in Austin, Texas, USA. I want to open a 900-1200 sq ft independent specialty coffee shop in or near East Austin within six months.
+
+          My founder constraints are:
+          - USD 180,000 available capital
+          - USD 30,000 of that must remain protected reserve
+          - no debt currently available
+          - I need the business eventually to pay me USD 8,000 per month
+          - maximum acceptable loss is USD 60,000
+          - I can work full-time
+
+          These are my CURRENT GUESSES, not verified facts. Persist them as low-confidence founder evidence and actively try to falsify them rather than agreeing with me:
+          - total setup/opening cost: USD 110,000
+          - monthly rent: USD 7,500
+          - monthly payroll: USD 32,000
+          - utilities and other operating overhead: USD 5,000/month
+          - blended gross margin: 72%
+          - average transaction: USD 10.50
+          - transactions per day: 260
+          - open 30 days/month
+          - shrinkage/wastage: 4%
+
+          Work autonomously now. Resolve and persist the correct jurisdiction and USD currency, create the Venture Twin, ingest my estimates as founder claims, research current Austin/Texas/US market economics, competition, registration/tax/licensing and execution dependencies using current sources, run the adversarial underwriting, and inspect the audit trail. Do not invent missing facts. Do not import Kenyan or other-country assumptions. If a material fact cannot be verified, leave it unresolved and say what smallest validation would resolve it.
+
+          Finish with the venture id, jurisdiction/currency, current decision, model evidence quality, critical unknowns, strongest case against the shop, and the single next action/evidence most likely to change the decision.
+          PROMPT
+          )
+          timeout 900 agents-cli run -v "$PROMPT" 2>&1 | tee artifacts/austin-adk-trace.log
+
+      - name: Verify the persisted Venture Twin independently of the agent answer
+        run: |
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          from app.domain import SpecialistRole
+          from app.runtime import get_service
+
+          service = get_service()
+          before = set(json.loads(Path("artifacts/before-venture-ids.json").read_text()))
+          ventures = service.list_ventures()
+          created = [item for item in ventures if item.id not in before]
+          if not created:
+              raise SystemExit("ADK root agent did not persist a new venture")
+          venture = max(created, key=lambda item: item.created_at)
+          specialists = service.specialists(venture.id)
+          events = service.events(venture.id)
+          validation = service.validation_tasks(venture.id)
+
+          payload = {
+              "venture": venture.model_dump(mode="json"),
+              "specialists": [item.model_dump(mode="json") for item in specialists],
+              "events": [item.model_dump(mode="json") for item in events],
+              "validation_tasks": [item.model_dump(mode="json") for item in validation],
+          }
+          Path("artifacts/austin-venture-proof.json").write_text(json.dumps(payload, indent=2, default=str))
+
+          jurisdiction = venture.intake.jurisdiction
+          if jurisdiction.country_code != "US":
+              raise SystemExit(f"Wrong country persisted: {jurisdiction.country_code}")
+          if jurisdiction.currency_code != "USD":
+              raise SystemExit(f"Wrong currency persisted: {jurisdiction.currency_code}")
+          if jurisdiction.subdivision != "Texas":
+              raise SystemExit(f"Wrong subdivision persisted: {jurisdiction.subdivision}")
+          if (jurisdiction.locality or "").lower() != "austin":
+              raise SystemExit(f"Wrong locality persisted: {jurisdiction.locality}")
+
+          assumption_units = {item.key: item.unit for item in venture.assumptions}
+          if any(unit and "KES" in unit for unit in assumption_units.values()):
+              raise SystemExit(f"Kenyan currency leaked into US model: {assumption_units}")
+
+          contamination_blob = json.dumps(payload).lower()
+          forbidden = ["kiambu", "kenya revenue authority", " kra ", "kes/month", "kes/transaction"]
+          leaked = [term for term in forbidden if term in contamination_blob]
+          if leaked:
+              raise SystemExit(f"Cross-country contamination detected: {leaked}")
+
+          founder_evidence = [item for item in venture.evidence if item.evidence_type.value == "founder"]
+          founder_keys = {item.assumption_key for item in founder_evidence}
+          expected_founder_keys = {
+              "setup_costs", "monthly_rent", "monthly_payroll", "monthly_utilities",
+              "gross_margin_pct", "average_basket", "transactions_per_day",
+              "days_open_month", "shrinkage_pct",
+          }
+          missing_founder = expected_founder_keys - founder_keys
+          if missing_founder:
+              raise SystemExit(f"Root agent failed to persist founder priors: {sorted(missing_founder)}")
+          if any(item.confidence.value not in {"low", "unknown"} for item in founder_evidence):
+              raise SystemExit("Agent promoted founder guesses above low confidence")
+
+          roles = {item.role for item in specialists}
+          if roles != set(SpecialistRole):
+              raise SystemExit(f"Specialist scope incomplete: {sorted(role.value for role in roles)}")
+
+          if venture.underwriting is None:
+              raise SystemExit("No deterministic underwriting result persisted")
+          if venture.underwriting.simulation_runs <= 0:
+              raise SystemExit(
+                  "Founder supplied all deterministic inputs but Monte Carlo underwriting did not execute"
+              )
+
+          event_types = {item.event_type.value for item in events}
+          for required in ("venture_created", "specialist_completed", "underwriting_completed"):
+              if required not in event_types:
+                  raise SystemExit(f"Missing persisted audit event: {required}")
+
+          print("REAL_ADK_AGENT_PROOF_PASS")
+          print("venture_id=", venture.id)
+          print("jurisdiction=", jurisdiction.model_dump(mode="json"))
+          print("decision=", venture.underwriting.decision.value)
+          print("simulation_runs=", venture.underwriting.simulation_runs)
+          print("break_even_probability_12m=", venture.underwriting.break_even_probability_12m)
+          print("evidence_coverage=", venture.underwriting.evidence_coverage)
+          print("critical_unknowns=", venture.underwriting.critical_unknowns)
+          print("biggest_risks=", venture.underwriting.biggest_risks)
+          print("specialists=", sorted(role.value for role in roles))
+          print("founder_prior_keys=", sorted(founder_keys))
+          print("validation_tasks=", [item.title for item in validation])
+          PY
+
+      - name: Assert ADK trace shows Cogen tool use
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          trace = Path("artifacts/austin-adk-trace.log").read_text(errors="replace")
+          required = ["create_venture", "add_founder_evidence", "run_underwriting", "inspect_audit_trail"]
+          missing = [name for name in required if name not in trace]
+          if missing:
+              raise SystemExit("Verbose ADK trace is missing required tool calls: " + ", ".join(missing))
+          print("ADK_TOOL_TRACE_PASS", required)
+          PY
+
+      - name: Upload inspectable ADK proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cogen-austin-live-agent-proof-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
