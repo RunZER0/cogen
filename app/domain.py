@@ -132,6 +132,30 @@ class EventType(StrEnum):
     ROADMAP_COMPLETED = "roadmap_completed"
 
 
+class JurisdictionContext(BaseModel):
+    """Explicit market/legal context for a venture.
+
+    Cogen must not silently inherit the developer's country. Unknown fields stay unknown until the
+    agent can resolve them from the user's location or authoritative evidence.
+    """
+
+    country_code: str | None = Field(default=None, min_length=2, max_length=3)
+    country_name: str | None = Field(default=None, min_length=2, max_length=100)
+    subdivision: str | None = Field(default=None, max_length=120)
+    locality: str | None = Field(default=None, max_length=120)
+    currency_code: str | None = Field(default=None, min_length=3, max_length=3)
+    locale: str | None = Field(default=None, max_length=32)
+    regulatory_scope: list[str] = Field(default_factory=list)
+
+    @field_validator("country_code", "currency_code")
+    @classmethod
+    def uppercase_codes(cls, value: str | None) -> str | None:
+        return value.upper() if value else value
+
+    def money_unit(self) -> str:
+        return self.currency_code or "LOCAL"
+
+
 class FounderProfile(BaseModel):
     available_capital: float = Field(gt=0)
     protected_reserve: float = Field(default=0, ge=0)
@@ -153,6 +177,7 @@ class VentureIntake(BaseModel):
     idea: str = Field(min_length=3, max_length=500)
     business_type: str = Field(default="general", min_length=2, max_length=100)
     location: str = Field(min_length=2, max_length=200)
+    jurisdiction: JurisdictionContext = Field(default_factory=JurisdictionContext)
     launch_target_months: int = Field(default=4, ge=1, le=60)
     founder: FounderProfile
     notes: str | None = Field(default=None, max_length=4000)
@@ -423,6 +448,7 @@ class ForkVentureRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
     location: str | None = Field(default=None, min_length=2, max_length=200)
     business_type: str | None = Field(default=None, min_length=2, max_length=100)
+    jurisdiction: JurisdictionContext | None = None
     assumption_overrides: dict[str, float] = Field(default_factory=dict)
 
 
