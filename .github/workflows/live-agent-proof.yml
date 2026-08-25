@@ -36,7 +36,7 @@ jobs:
           uv sync --extra dev --python 3.13
           uv tool install google-agents-cli
           agents-cli --version
-          agents-cli cmd-info --json
+          agents-cli run --help >/dev/null
 
       - name: Verify live credentials exist without printing them
         run: |
