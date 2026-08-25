@@ -28,10 +28,17 @@ def get_research_provider() -> ResearchProvider:
         return GeminiGroundedResearchProvider(
             model=settings.gemini_model,
             api_key=settings.gemini_api_key,
+            fallback_model=settings.gemini_fallback_model,
+            attempts_per_model=settings.gemini_attempts_per_model,
         )
     return OfflineResearchProvider()
 
 
 @lru_cache
 def get_service() -> VentureService:
-    return VentureService(get_repository(), get_research_provider())
+    settings = get_settings()
+    return VentureService(
+        get_repository(),
+        get_research_provider(),
+        specialist_research_rounds=settings.specialist_research_rounds,
+    )
