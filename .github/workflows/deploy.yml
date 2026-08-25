@@ -129,9 +129,14 @@ jobs:
         run: |
           set -euo pipefail
           URL="${{ steps.service.outputs.url }}"
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$URL/healthz"
+          request() {
+            curl --fail --silent --show-error \
+              --retry 12 --retry-delay 3 --retry-all-errors \
+              --connect-timeout 10 --max-time 20 "$1"
+          }
+          request "$URL/healthz"
           echo
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$URL/readyz"
+          request "$URL/readyz"
           echo
 
       - name: Run canonical live Gemini + Neon E2E
@@ -140,6 +145,7 @@ jobs:
           set -euo pipefail
           URL="${{ steps.service.outputs.url }}"
           curl --fail --silent --show-error \
+            --retry 3 --retry-delay 5 --retry-all-errors \
             --max-time 290 \
             -X POST "$URL/api/demo" \
             -H 'Content-Type: application/json' \
@@ -155,12 +161,36 @@ jobs:
           print('decision=', underwriting.get('decision'))
           print('evidence_count=', len(evidence))
           print('simulation_runs=', underwriting.get('simulation_runs'))
+          print('critical_unknowns=', underwriting.get('critical_unknowns'))
+          print('biggest_risks=', underwriting.get('biggest_risks'))
           if not data.get('id'):
               raise SystemExit('live demo returned no venture id')
           if underwriting.get('simulation_runs', 0) <= 0:
               raise SystemExit('deterministic underwriting did not run')
           PY
 
-      - name: Remove temporary env file
+      - name: Inspect live specialist and validation outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ steps.service.outputs.url }}"
+          VENTURE_ID="$(python -c "import json; print(json.load(open('/tmp/cogen-live-demo.json'))['id'])")"
+          curl --fail --silent "$URL/api/ventures/$VENTURE_ID/specialists" -o /tmp/specialists.json
+          curl --fail --silent "$URL/api/ventures/$VENTURE_ID/validation" -o /tmp/validation.json
+          curl --fail --silent "$URL/api/ventures/$VENTURE_ID/events" -o /tmp/events.json
+          python - <<'PY'
+          import json
+          for name in ('specialists', 'validation', 'events'):
+              data = json.load(open(f'/tmp/{name}.json'))
+              print(f'{name}_count=', len(data))
+              if name == 'specialists':
+                  print('specialist_roles=', [item.get('role') for item in data])
+              if name == 'validation':
+                  print('validation_titles=', [item.get('title') for item in data])
+              if name == 'events':
+                  print('event_types=', [item.get('event_type') for item in data])
+          PY
+
+      - name: Remove temporary files
         if: always()
-        run: rm -f /tmp/cogen-env.yaml /tmp/cogen-live-demo.json
+        run: rm -f /tmp/cogen-env.yaml /tmp/cogen-live-demo.json /tmp/specialists.json /tmp/validation.json /tmp/events.json
