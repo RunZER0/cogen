@@ -35,7 +35,7 @@ class VentureEngine:
     def initialise(self, venture: Venture) -> Venture:
         if venture.assumptions:
             return venture
-        venture.assumptions = self._starter_assumptions()
+        venture.assumptions = self._starter_assumptions(venture)
         venture.roadmap = self._starter_roadmap(venture)
         venture.status = VentureStatus.UNDERWRITE
         venture.updated_at = datetime.now(UTC)
@@ -72,7 +72,8 @@ class VentureEngine:
                 assumption.unit = finding.unit
             if CONFIDENCE_SCORE[finding.confidence] >= CONFIDENCE_SCORE[assumption.confidence]:
                 assumption.confidence = finding.confidence
-            assumption.evidence_ids.append(evidence.id)
+            if evidence.id not in assumption.evidence_ids:
+                assumption.evidence_ids.append(evidence.id)
             assumption.source_note = finding.claim
             assumption.updated_at = datetime.now(UTC)
         venture.status = VentureStatus.ATTACK
@@ -116,12 +117,15 @@ class VentureEngine:
         critical_unknowns = [
             item.label
             for item in venture.assumptions
-            if item.critical
-            and (
-                item.value is None
-                or item.confidence in {Confidence.UNKNOWN, Confidence.LOW}
-            )
+            if item.critical and self._assumption_unresolved(item)
         ]
+        jurisdiction = venture.intake.jurisdiction
+        if not jurisdiction.country_code:
+            critical_unknowns.append("Country / legal jurisdiction")
+        if not jurisdiction.currency_code:
+            critical_unknowns.append("Operating currency")
+        critical_unknowns = list(dict.fromkeys(critical_unknowns))
+
         coverage = evidence_coverage(venture)
         inputs = extract_inputs(assumptions)
         if inputs is None:
@@ -161,6 +165,7 @@ class VentureEngine:
                     probability,
                     critical_unknowns,
                     base,
+                    venture.intake.jurisdiction.money_unit(),
                 ),
                 simulation_runs=simulation_runs,
             )
@@ -194,17 +199,18 @@ class VentureEngine:
         return venture
 
     @staticmethod
-    def _starter_assumptions() -> list[Assumption]:
+    def _starter_assumptions(venture: Venture) -> list[Assumption]:
+        currency = venture.intake.jurisdiction.money_unit()
         specs = [
-            ("setup_costs", "Total setup and opening inventory cost", AssumptionCategory.CAPITAL, "KES", True, 2.0),
-            ("monthly_rent", "Monthly premises rent", AssumptionCategory.LOCATION, "KES/month", True, 1.8),
-            ("monthly_payroll", "Monthly payroll", AssumptionCategory.COST, "KES/month", False, 1.2),
-            ("monthly_utilities", "Monthly utilities and overhead", AssumptionCategory.COST, "KES/month", False, 1.0),
+            ("setup_costs", "Total setup and opening inventory cost", AssumptionCategory.CAPITAL, currency, True, 2.0),
+            ("monthly_rent", "Monthly premises rent", AssumptionCategory.LOCATION, f"{currency}/month", True, 1.8),
+            ("monthly_payroll", "Monthly payroll", AssumptionCategory.COST, f"{currency}/month", False, 1.2),
+            ("monthly_utilities", "Monthly utilities and overhead", AssumptionCategory.COST, f"{currency}/month", False, 1.0),
             ("gross_margin_pct", "Blended gross margin", AssumptionCategory.MARGIN, "ratio", True, 2.0),
-            ("average_basket", "Average customer basket", AssumptionCategory.DEMAND, "KES/transaction", True, 2.0),
+            ("average_basket", "Average customer transaction value", AssumptionCategory.DEMAND, f"{currency}/transaction", True, 2.0),
             ("transactions_per_day", "Daily transactions / demand", AssumptionCategory.DEMAND, "transactions/day", True, 3.0),
             ("days_open_month", "Trading days per month", AssumptionCategory.OPERATIONS, "days/month", False, 0.6),
-            ("shrinkage_pct", "Shrinkage and spoilage rate", AssumptionCategory.OPERATIONS, "ratio", False, 1.0),
+            ("shrinkage_pct", "Shrinkage, spoilage or wastage rate", AssumptionCategory.OPERATIONS, "ratio", False, 1.0),
             ("regulatory_registration_path", "Registration and legal operating path", AssumptionCategory.REGULATORY, None, True, 1.5),
             ("competition_local", "Material local competitors", AssumptionCategory.COMPETITION, None, True, 1.7),
         ]
@@ -224,12 +230,13 @@ class VentureEngine:
     def _starter_roadmap(venture: Venture) -> list[RoadmapStep]:
         location = venture.intake.location
         idea = venture.intake.idea
+        country = venture.intake.jurisdiction.country_name or venture.intake.jurisdiction.country_code or "the target jurisdiction"
         rows = [
             ("FEASIBILITY", "Close the critical evidence gaps", "Resolve assumptions capable of killing the business before committing capital.", False, False, None, False),
             ("LOCATION", "Validate the proposed location", "Verify rent, access, demand and direct competitor pressure for the actual premises.", True, True, f"Commercial premises and local competition for {idea} in {location}", False),
-            ("REGISTRATION", "Confirm and complete business registration", "Use official sources to identify the correct registration route and required documents.", False, True, f"Official business registration requirements for {idea} in {location}", True),
-            ("TAX", "Confirm tax registrations and recurring obligations", "Identify only obligations supported by current official tax authority guidance.", False, True, f"Official tax registration obligations for {idea} in {location}", True),
-            ("LICENSING", "Resolve county and sector licences", "Find actual permits, inspections, fees and prerequisites using official sources.", True, True, f"Official county and sector licences for {idea} in {location}", True),
+            ("REGISTRATION", "Confirm and complete business registration", "Use official sources to identify the correct national/subnational registration route and required documents.", False, True, f"Official business registration requirements for {idea} in {location}, {country}", True),
+            ("TAX", "Confirm tax registrations and recurring obligations", "Identify obligations supported by the competent national, state/provincial and local tax authorities.", False, True, f"Official tax registration and recurring tax obligations for {idea} in {location}, {country}", True),
+            ("LICENSING", "Resolve local and sector licences", "Find actual permits, licences, inspections, fees and prerequisites at every applicable jurisdictional level.", True, True, f"Official national, state/provincial, municipal/local and sector licences for {idea} in {location}, {country}", True),
             ("SUPPLIERS", "Source and compare suppliers", "Obtain comparable quotes and replace estimates with verified commercial terms.", False, False, f"Suppliers and wholesalers relevant to {idea} near {location}", False),
             ("SERVICES", "Find execution providers", "Identify professionals, installers or providers required by unresolved dependencies.", False, False, f"Service providers required to launch {idea} near {location}", False),
             ("PREMISES", "Commit to premises only after the location gate passes", "Do not sign a lease while a critical location or demand assumption remains weak.", True, True, None, False),
@@ -282,11 +289,7 @@ class VentureEngine:
                     bool(critical)
                     or decision in {Decision.REJECT, Decision.NEEDS_DATA}
                 )
-                step.status = (
-                    GateStatus.READY
-                    if deps_complete and not blocked
-                    else GateStatus.LOCKED
-                )
+                step.status = GateStatus.READY if deps_complete and not blocked else GateStatus.LOCKED
             statuses[step.id] = step.status
 
     def _missing_required_assumptions(
@@ -298,6 +301,16 @@ class VentureEngine:
             for key in sorted(self.REQUIRED_FINANCIAL_KEYS)
             if assumptions.get(key) is None or assumptions[key].value is None
         ]
+
+    @staticmethod
+    def _assumption_unresolved(item: Assumption) -> bool:
+        if item.confidence in {Confidence.UNKNOWN, Confidence.LOW}:
+            return True
+        if item.unit is not None and item.value is None:
+            return True
+        if item.unit is None and not item.evidence_ids:
+            return True
+        return False
 
     @staticmethod
     def _decision(
@@ -330,10 +343,11 @@ class VentureEngine:
         probability: float,
         critical_unknowns: list[str],
         base: dict[str, float],
+        currency: str,
     ) -> list[str]:
         lines = [
             f"The model produced a {probability:.0%} probability of surviving cash burn and reaching the founder's month-12 operating-income target under current assumptions.",
-            f"Base-case capital remaining after setup is {base['capital_remaining']:,.0f} in the founder's stated currency context.",
+            f"Base-case capital remaining after setup is {base['capital_remaining']:,.0f} {currency}.",
         ]
         if critical_unknowns:
             lines.append(
@@ -342,15 +356,11 @@ class VentureEngine:
                 + "."
             )
         if decision == Decision.REJECT:
-            lines.append(
-                "Change the current configuration before irreversible capital is committed."
-            )
+            lines.append("Change the current configuration before irreversible capital is committed.")
         elif decision == Decision.APPROVE:
             lines.append("No critical weak assumption currently blocks execution.")
         else:
-            lines.append(
-                "Proceed only after the listed evidence gaps are resolved and the model is re-run."
-            )
+            lines.append("Proceed only after the listed evidence gaps are resolved and the model is re-run.")
         return lines
 
     @staticmethod
