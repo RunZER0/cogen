@@ -66,7 +66,11 @@ class VentureService:
             venture.id,
             EventType.VENTURE_CREATED,
             f"{venture.id}:created",
-            {"idea": intake.idea, "location": intake.location},
+            {
+                "idea": intake.idea,
+                "location": intake.location,
+                "jurisdiction": intake.jurisdiction.model_dump(mode="json"),
+            },
             actor="founder",
         )
         return venture
@@ -122,7 +126,7 @@ class VentureService:
         except (TimeoutError, ConnectionError) as exc:
             job.status = JobStatus.RETRYABLE
             job.message = f"{type(exc).__name__}: {exc}"
-        except Exception as exc:  # persist failure for async diagnosis
+        except Exception as exc:
             job.status = JobStatus.FAILED
             job.message = f"{type(exc).__name__}: {exc}"
         job.updated_at = datetime.now(UTC)
@@ -183,11 +187,7 @@ class VentureService:
             confidence=request.confidence,
         )
         venture = self.engine.apply_change(venture, change)
-        invalidated = (
-            invalidate_dependents(venture, request.assumption_key)
-            if request.assumption_key
-            else []
-        )
+        invalidated = invalidate_dependents(venture, request.assumption_key) if request.assumption_key else []
         if invalidated:
             venture = self.engine.underwrite(venture)
         self.repository.save_venture(venture)
@@ -285,6 +285,15 @@ class VentureService:
                 "idea": "Open a neighbourhood supermarket/minimart",
                 "business_type": "supermarket retail",
                 "location": "Ruiru, Kiambu County, Kenya",
+                "jurisdiction": {
+                    "country_code": "KE",
+                    "country_name": "Kenya",
+                    "subdivision": "Kiambu County",
+                    "locality": "Ruiru",
+                    "currency_code": "KES",
+                    "locale": "en-KE",
+                    "regulatory_scope": ["Kenya", "Kiambu County"],
+                },
                 "launch_target_months": 4,
                 "founder": {
                     "available_capital": 1_800_000,
