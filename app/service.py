@@ -41,12 +41,16 @@ class VentureService:
         state: StateStore | None = None,
         orchestrator: SpecialistOrchestrator | None = None,
         workflow_runner: WorkflowRunner | None = None,
+        specialist_research_rounds: int = 2,
     ):
         self.repository = repository
         self.research_provider = research_provider
         self.engine = engine or VentureEngine()
         self.state = state or StateStore(repository)
-        self.orchestrator = orchestrator or SpecialistOrchestrator(research_provider)
+        self.orchestrator = orchestrator or SpecialistOrchestrator(
+            research_provider,
+            max_rounds=specialist_research_rounds,
+        )
         self.workflow_runner = workflow_runner or WorkflowRunner(
             repository,
             self.state,
@@ -272,6 +276,7 @@ class VentureService:
         return {
             "database": "ok" if self.repository.ping() else "failed",
             "persistent_state": True,
+            "research_runtime": self.research_provider.runtime_health(),
         }
 
     def demo_venture(self) -> Venture:
