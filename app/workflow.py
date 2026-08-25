@@ -38,8 +38,8 @@ class SimulatedCrash(RuntimeError):
 class WorkflowRunner:
     """Checkpointed, idempotent analysis workflow.
 
-    Every completed phase is durably recorded. A retry with the same workflow resumes at the first
-    incomplete phase instead of recreating the venture or replaying completed state writes.
+    Completed phases are durably recorded. Research also checkpoints after each specialist, so a retry
+    does not pay to rerun roles whose report and candidate-evidence batch are already persisted.
     """
 
     def __init__(
@@ -73,6 +73,7 @@ class WorkflowRunner:
         workflow_id: str,
         *,
         stop_after_phase: WorkflowPhase | None = None,
+        stop_after_specialist: SpecialistRole | None = None,
     ) -> WorkflowRun:
         workflow = self.state.get_workflow(workflow_id)
         if workflow is None:
@@ -91,7 +92,11 @@ class WorkflowRunner:
                 if phase in workflow.completed_phases:
                     continue
                 workflow.phase = phase
-                self._run_phase(workflow, phase)
+                self._run_phase(
+                    workflow,
+                    phase,
+                    stop_after_specialist=stop_after_specialist,
+                )
                 workflow.completed_phases.append(phase)
                 workflow.updated_at = datetime.now(UTC)
                 self.state.save_workflow(workflow)
@@ -108,9 +113,9 @@ class WorkflowRunner:
             workflow.status = WorkflowStatus.COMPLETE
             workflow.updated_at = datetime.now(UTC)
             return self.state.save_workflow(workflow)
-        except SimulatedCrash:
+        except SimulatedCrash as exc:
             workflow.status = WorkflowStatus.RETRYABLE
-            workflow.last_error = "simulated process death"
+            workflow.last_error = str(exc)
             workflow.updated_at = datetime.now(UTC)
             self.state.save_workflow(workflow)
             raise
@@ -127,7 +132,13 @@ class WorkflowRunner:
             self.state.save_workflow(workflow)
             raise
 
-    def _run_phase(self, workflow: WorkflowRun, phase: WorkflowPhase) -> None:
+    def _run_phase(
+        self,
+        workflow: WorkflowRun,
+        phase: WorkflowPhase,
+        *,
+        stop_after_specialist: SpecialistRole | None = None,
+    ) -> None:
         venture = self.repository.get_venture(workflow.venture_id)
         if venture is None:
             raise KeyError("Venture not found")
@@ -136,35 +147,11 @@ class WorkflowRunner:
             return
 
         if phase == WorkflowPhase.RESEARCH:
-            result = self.orchestrator.run(venture, workflow.id)
-            batch = ResearchBatch(
-                id=f"{workflow.id}:research",
-                venture_id=venture.id,
-                workflow_id=workflow.id,
-                findings=[asdict(item) for item in result.findings],
-                rejected=result.rejected,
+            self._run_research(
+                workflow,
+                venture,
+                stop_after_specialist=stop_after_specialist,
             )
-            self.state.save_research_batch(batch)
-            for report in result.reports:
-                self.state.save_specialist_report(report)
-                self.state.event(
-                    venture.id,
-                    EventType.SPECIALIST_COMPLETED,
-                    f"{workflow.id}:specialist:{report.role.value}",
-                    {
-                        "role": report.role.value,
-                        "finding_count": report.finding_count,
-                        "rejected_count": report.rejected_count,
-                    },
-                )
-            for contradiction in result.contradictions:
-                self.state.save_contradiction(contradiction)
-                self.state.event(
-                    venture.id,
-                    EventType.CONTRADICTION_DETECTED,
-                    f"{workflow.id}:contradiction:{contradiction.id}",
-                    {"assumption_key": contradiction.assumption_key},
-                )
             return
 
         if phase == WorkflowPhase.SYNTHESIS:
@@ -211,6 +198,80 @@ class WorkflowRunner:
 
         if phase == WorkflowPhase.MONITOR:
             return
+
+    def _run_research(
+        self,
+        workflow: WorkflowRun,
+        venture,
+        *,
+        stop_after_specialist: SpecialistRole | None,
+    ) -> None:
+        reports = [
+            report
+            for report in self.state.list_specialist_reports(venture.id)
+            if report.workflow_id == workflow.id
+        ]
+        completed_roles = {report.role for report in reports}
+        batch = self.state.research_batch_for_workflow(venture.id, workflow.id)
+        if batch is None:
+            batch = ResearchBatch(
+                id=f"{workflow.id}:research",
+                venture_id=venture.id,
+                workflow_id=workflow.id,
+            )
+
+        seen = {
+            self._finding_key(self._finding_from_dict(raw))
+            for raw in batch.findings
+        }
+
+        for role in self.orchestrator.roles:
+            if role in completed_roles:
+                continue
+            result = self.orchestrator.run_role(venture, workflow.id, role, seen=seen)
+            for item in result.findings:
+                key = self._finding_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                batch.findings.append(asdict(item))
+            batch.rejected.extend(result.rejected)
+            batch.rejected = list(dict.fromkeys(batch.rejected))
+            self.state.save_research_batch(batch)
+
+            report = result.reports[0]
+            report.id = f"{workflow.id}:specialist:{role.value}"
+            self.state.save_specialist_report(report)
+            self.state.event(
+                venture.id,
+                EventType.SPECIALIST_COMPLETED,
+                f"{workflow.id}:specialist:{role.value}",
+                {
+                    "role": role.value,
+                    "finding_count": report.finding_count,
+                    "rejected_count": report.rejected_count,
+                },
+            )
+            for contradiction in result.contradictions:
+                self.state.save_contradiction(contradiction)
+                self.state.event(
+                    venture.id,
+                    EventType.CONTRADICTION_DETECTED,
+                    f"{workflow.id}:contradiction:{contradiction.id}",
+                    {"assumption_key": contradiction.assumption_key},
+                )
+
+            if stop_after_specialist == role:
+                raise SimulatedCrash(f"simulated process death after specialist {role.value}")
+
+    @staticmethod
+    def _finding_key(item: ResearchFinding) -> tuple:
+        return (
+            item.assumption_key,
+            item.claim.strip().lower(),
+            item.value,
+            item.source_url,
+        )
 
     @staticmethod
     def _finding_from_dict(raw: dict) -> ResearchFinding:
