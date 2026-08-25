@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.resilient_adk_model import ResilientGemini
@@ -18,8 +20,7 @@ class Fake503(Exception):
     code = 503
 
 
-@pytest.mark.asyncio
-async def test_transient_primary_failure_falls_back_with_fresh_request(monkeypatch):
+def test_transient_primary_failure_falls_back_with_fresh_request(monkeypatch):
     calls = []
 
     class FakeGemini:
@@ -41,8 +42,11 @@ async def test_transient_primary_failure_falls_back_with_fresh_request(monkeypat
         attempts_per_model=2,
     )
     original = FakeRequest()
-    outputs = [item async for item in model.generate_content_async(original)]
 
+    async def collect():
+        return [item async for item in model.generate_content_async(original)]
+
+    outputs = asyncio.run(collect())
     assert outputs == [{"model": "gemini-fallback", "marker": ["gemini-fallback"]}]
     assert calls == [
         ("gemini-primary", ["gemini-primary"]),
@@ -53,8 +57,7 @@ async def test_transient_primary_failure_falls_back_with_fresh_request(monkeypat
     assert model.snapshot()["last_successful_model"] == "gemini-fallback"
 
 
-@pytest.mark.asyncio
-async def test_non_transient_primary_error_does_not_fallback(monkeypatch):
+def test_non_transient_primary_error_does_not_fallback(monkeypatch):
     calls = []
 
     class Fake400(Exception):
@@ -73,14 +76,16 @@ async def test_non_transient_primary_error_does_not_fallback(monkeypatch):
     monkeypatch.setattr("app.resilient_adk_model.Gemini", FakeGemini)
     model = ResilientGemini(model="gemini-primary", fallback_model="gemini-fallback")
 
+    async def collect():
+        return [item async for item in model.generate_content_async(FakeRequest())]
+
     with pytest.raises(Fake400):
-        _ = [item async for item in model.generate_content_async(FakeRequest())]
+        asyncio.run(collect())
     assert calls == ["gemini-primary"]
     assert model.snapshot()["fallback_count"] == 0
 
 
-@pytest.mark.asyncio
-async def test_fallback_failure_is_not_hidden(monkeypatch):
+def test_fallback_failure_is_not_hidden(monkeypatch):
     calls = []
 
     class FakeGemini:
@@ -96,6 +101,9 @@ async def test_fallback_failure_is_not_hidden(monkeypatch):
     monkeypatch.setattr("app.resilient_adk_model.Gemini", FakeGemini)
     model = ResilientGemini(model="gemini-primary", fallback_model="gemini-fallback")
 
+    async def collect():
+        return [item async for item in model.generate_content_async(FakeRequest())]
+
     with pytest.raises(Fake503):
-        _ = [item async for item in model.generate_content_async(FakeRequest())]
+        asyncio.run(collect())
     assert calls == ["gemini-primary", "gemini-fallback"]
