@@ -5,6 +5,8 @@ from app.domain import IntakeDraft, IntakeDraftRequest, utc_now
 
 MATERIAL_FIELDS = (
     "location",
+    "country_code",
+    "currency_code",
     "available_capital",
     "protected_reserve",
     "target_monthly_owner_income",
@@ -13,7 +15,9 @@ MATERIAL_FIELDS = (
 )
 
 QUESTIONS = {
-    "location": "Where would this business operate? Give the town/area if you know it.",
+    "location": "Where would this business operate? Give the town/city and region if you know them.",
+    "country_code": "Which country will legally host the business?",
+    "currency_code": "Which currency should Cogen use for the venture's capital and operating model?",
     "available_capital": "How much money can you actually put into this venture?",
     "protected_reserve": "How much of that money must remain untouched as your safety reserve?",
     "target_monthly_owner_income": "What monthly income must the business eventually pay you?",
