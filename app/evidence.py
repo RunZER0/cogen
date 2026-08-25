@@ -33,12 +33,7 @@ class EvidencePreparation:
 
 
 class EvidenceLedger:
-    """Deterministic guardrail around model-generated research.
-
-    The model may propose evidence; this layer decides whether it is admissible, duplicate, contradictory,
-    or too weak for a consequential claim. That prevents a specialist from voting fabricated licensing or
-    pricing information into the canonical Venture Twin.
-    """
+    """Deterministic guardrail around model-generated research."""
 
     def prepare(
         self,
@@ -146,22 +141,51 @@ def invalidate_dependents(venture: Venture, changed_key: str) -> list[str]:
     return sorted(set(invalidated))
 
 
-def invalidate_for_location_fork(venture: Venture) -> list[str]:
-    invalidated: list[str] = []
-    location_sensitive = {
-        AssumptionCategory.LOCATION,
-        AssumptionCategory.DEMAND,
-        AssumptionCategory.COMPETITION,
-    }
-    keys = {item.key for item in venture.assumptions if item.category in location_sensitive}
+def _invalidate_categories(
+    venture: Venture,
+    categories: set[AssumptionCategory],
+    reason: str,
+) -> list[str]:
+    keys = {item.key for item in venture.assumptions if item.category in categories}
     for assumption in venture.assumptions:
         if assumption.key not in keys:
             continue
         assumption.value = None
         assumption.confidence = Confidence.UNKNOWN
         assumption.evidence_ids = []
-        assumption.source_note = "Invalidated by location fork"
+        assumption.source_note = reason
         assumption.stale = True
-        invalidated.append(assumption.key)
     venture.evidence = [item for item in venture.evidence if item.assumption_key not in keys]
-    return sorted(invalidated)
+    return sorted(keys)
+
+
+def invalidate_for_location_fork(venture: Venture) -> list[str]:
+    """Invalidate facts that cannot safely travel to a new premises/city."""
+    return _invalidate_categories(
+        venture,
+        {
+            AssumptionCategory.LOCATION,
+            AssumptionCategory.DEMAND,
+            AssumptionCategory.COMPETITION,
+            AssumptionCategory.REGULATORY,
+        },
+        "Invalidated by location fork",
+    )
+
+
+def invalidate_for_jurisdiction_fork(venture: Venture) -> list[str]:
+    """Invalidate market, legal and execution evidence when the governing jurisdiction changes."""
+    return _invalidate_categories(
+        venture,
+        {
+            AssumptionCategory.LOCATION,
+            AssumptionCategory.DEMAND,
+            AssumptionCategory.COMPETITION,
+            AssumptionCategory.REGULATORY,
+            AssumptionCategory.EXECUTION,
+            AssumptionCategory.COST,
+            AssumptionCategory.MARGIN,
+            AssumptionCategory.OPERATIONS,
+        },
+        "Invalidated by jurisdiction fork",
+    )
