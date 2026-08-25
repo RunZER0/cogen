@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from app.domain import ForkVentureRequest, Venture, VentureFork, new_id, utc_now
-from app.evidence import invalidate_for_location_fork
+from app.evidence import invalidate_for_jurisdiction_fork, invalidate_for_location_fork
 
 
 def fork_venture(parent: Venture, request: ForkVentureRequest) -> tuple[Venture, VentureFork]:
@@ -18,14 +18,20 @@ def fork_venture(parent: Venture, request: ForkVentureRequest) -> tuple[Venture,
 
     invalidated: list[str] = []
     changed_fields: dict[str, object] = {}
+    jurisdiction_changed = bool(
+        request.jurisdiction and request.jurisdiction != parent.intake.jurisdiction
+    )
+
     if request.location and request.location != parent.intake.location:
         child.intake.location = request.location
         changed_fields["location"] = request.location
-        invalidated.extend(invalidate_for_location_fork(child))
-    if request.jurisdiction and request.jurisdiction != parent.intake.jurisdiction:
+        if not jurisdiction_changed:
+            invalidated.extend(invalidate_for_location_fork(child))
+
+    if jurisdiction_changed and request.jurisdiction:
         child.intake.jurisdiction = request.jurisdiction
         changed_fields["jurisdiction"] = request.jurisdiction.model_dump(mode="json")
-        invalidated.extend(invalidate_for_location_fork(child))
+        invalidated.extend(invalidate_for_jurisdiction_fork(child))
         currency = request.jurisdiction.money_unit()
         assumptions = child.assumption_map()
         unit_updates = {
@@ -38,6 +44,7 @@ def fork_venture(parent: Venture, request: ForkVentureRequest) -> tuple[Venture,
         for key, unit in unit_updates.items():
             if key in assumptions:
                 assumptions[key].unit = unit
+
     if request.business_type and request.business_type != parent.intake.business_type:
         child.intake.business_type = request.business_type
         changed_fields["business_type"] = request.business_type
