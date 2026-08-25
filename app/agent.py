@@ -10,8 +10,6 @@ import json
 
 from google.adk.agents import Agent
 from google.adk.apps import App
-from google.adk.models import Gemini
-from google.genai import types
 
 from app.domain import (
     AddEvidenceRequest,
@@ -21,6 +19,7 @@ from app.domain import (
     SandboxRequest,
     VentureIntake,
 )
+from app.resilient_adk_model import ResilientGemini
 from app.runtime import get_service
 from app.settings import get_settings
 
@@ -93,12 +92,14 @@ def complete_execution_step(venture_id: str, step_id: str) -> str:
 
 
 settings = get_settings()
+root_model = ResilientGemini(
+    model=settings.gemini_model,
+    fallback_model=settings.gemini_fallback_model,
+    attempts_per_model=settings.gemini_attempts_per_model,
+)
 root_agent = Agent(
     name="venture_underwriter",
-    model=Gemini(
-        model=settings.gemini_model,
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
+    model=root_model,
     instruction="""
 You are Cogen, a persistent adversarial venture-building partner for founders in any country.
 
