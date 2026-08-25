@@ -6,7 +6,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+from app.context import WorkingContextBuilder
 from app.domain import Confidence, EvidenceType, SpecialistRole, Venture
+from app.model_runtime import GeminiModelRouter
 from app.source_router import policy_for
 
 
@@ -33,6 +35,9 @@ class ResearchProvider(ABC):
         role: SpecialistRole | None = None,
         mandate: str | None = None,
     ) -> list[ResearchFinding]: ...
+
+    def runtime_health(self) -> dict[str, object]:
+        return {"provider": type(self).__name__, "status": "ok"}
 
 
 class OfflineResearchProvider(ResearchProvider):
@@ -106,13 +111,27 @@ class OfflineResearchProvider(ResearchProvider):
 
 
 class GeminiGroundedResearchProvider(ResearchProvider):
-    """Live research provider using Gemini 3.7 Flash and Google Search grounding."""
+    """Live research provider using bounded context, Google Search grounding and model fallback."""
 
-    def __init__(self, model: str = "gemini-3.7-flash", api_key: str | None = None):
+    def __init__(
+        self,
+        model: str = "gemini-3.7-flash",
+        api_key: str | None = None,
+        *,
+        fallback_model: str | None = "gemini-3.6-flash",
+        attempts_per_model: int = 2,
+        context_builder: WorkingContextBuilder | None = None,
+    ):
         from google import genai
 
         self.model = model
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
+        self.router = GeminiModelRouter(
+            model,
+            fallback=fallback_model,
+            attempts_per_model=attempts_per_model,
+        )
+        self.context_builder = context_builder or WorkingContextBuilder()
 
     def research(
         self,
@@ -124,8 +143,8 @@ class GeminiGroundedResearchProvider(ResearchProvider):
         prompt = self._build_prompt(venture, role=role, mandate=mandate)
         from google.genai import types
 
-        response = self.client.models.generate_content(
-            model=self.model,
+        response = self.router.generate(
+            self.client,
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -159,6 +178,13 @@ class GeminiGroundedResearchProvider(ResearchProvider):
             )
         return [finding for finding in findings if finding.assumption_key and finding.claim]
 
+    def runtime_health(self) -> dict[str, object]:
+        return {
+            "provider": type(self).__name__,
+            "status": "ok",
+            "model": self.router.snapshot(),
+        }
+
     def _build_prompt(
         self,
         venture: Venture,
@@ -166,34 +192,29 @@ class GeminiGroundedResearchProvider(ResearchProvider):
         role: SpecialistRole | None,
         mandate: str | None,
     ) -> str:
-        intake = venture.intake
-        keys = [item.key for item in venture.assumptions]
-        role_text = role.value if role else "general diligence"
-        policy = policy_for(role) if role else None
-        source_text = ", ".join(policy.preferred_sources) if policy else "best current sources"
+        role = role or SpecialistRole.ADVERSARY
+        mandate = mandate or "find evidence that materially changes the launch decision"
+        policy = policy_for(role)
+        source_text = ", ".join(policy.preferred_sources)
         official_text = (
             "For every material regulatory/legal claim, use an official source URL or return no claim."
-            if policy and policy.official_required
+            if policy.official_required
             else "Prefer primary/current sources over summaries."
         )
+        working_context = self.context_builder.build(venture, role, mandate)
         return f"""
-You are the {role_text} specialist inside Cogen, a persistent adversarial venture-underwriting system.
-Your job is narrow: {mandate or 'find evidence that materially changes the launch decision'}.
-Search the current web using Google Search grounding.
+You are a scoped research specialist inside Cogen, a persistent adversarial venture-underwriting system.
+You do not own venture state. You return candidate evidence; deterministic evidence policy decides what
+is admitted. Search the current web using Google Search grounding.
 
-Business idea: {intake.idea}
-Business type: {intake.business_type}
-Location: {intake.location}
-Available capital: {intake.founder.available_capital}
-Protected reserve: {intake.founder.protected_reserve}
-Owner income target: {intake.founder.target_monthly_owner_income}
-Existing assumption keys: {keys}
+{working_context}
 
-Source preference: {source_text}.
+SOURCE POLICY: {source_text}.
 {official_text}
 Attack the business case before supporting it. Do not invent a fee, law, licence, supplier, professional,
 price, review, statistic, market size or URL. If a material value cannot be established, either return null
-with the uncertainty explained or omit it. Do not convert model inference into observed evidence.
+with the uncertainty explained or omit it. Do not convert model inference or prior simulation into observed
+evidence. Prefer evidence capable of resolving a critical or high-impact unknown over low-value background.
 
 Return ONLY a JSON array. Each object must contain:
 assumption_key, claim, value (number or null), unit, evidence_type
@@ -225,7 +246,7 @@ prefixed regulatory_ or execution_.
         except ValueError:
             claimed = Confidence.LOW
         if not source_url:
-            return min(claimed, Confidence.LOW, key=lambda item: list(Confidence).index(item))
+            return Confidence.LOW
         if grounded_urls and source_url not in grounded_urls:
             return Confidence.LOW
         return claimed
