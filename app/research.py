@@ -6,7 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from app.domain import Confidence, EvidenceType, Venture
+from app.domain import Confidence, EvidenceType, SpecialistRole, Venture
+from app.source_router import policy_for
 
 
 @dataclass(slots=True)
@@ -20,11 +21,18 @@ class ResearchFinding:
     source_title: str
     source_url: str | None = None
     notes: str | None = None
+    role: SpecialistRole | None = None
 
 
 class ResearchProvider(ABC):
     @abstractmethod
-    def research(self, venture: Venture) -> list[ResearchFinding]: ...
+    def research(
+        self,
+        venture: Venture,
+        *,
+        role: SpecialistRole | None = None,
+        mandate: str | None = None,
+    ) -> list[ResearchFinding]: ...
 
 
 class OfflineResearchProvider(ResearchProvider):
@@ -45,7 +53,29 @@ class OfflineResearchProvider(ResearchProvider):
         ("shrinkage_pct", 0.02, "ratio", "Illustrative shrinkage/spoilage rate"),
     ]
 
-    def research(self, venture: Venture) -> list[ResearchFinding]:
+    ROLE_KEYS = {
+        SpecialistRole.FINANCE: {
+            "setup_costs",
+            "monthly_rent",
+            "monthly_payroll",
+            "monthly_utilities",
+            "gross_margin_pct",
+            "shrinkage_pct",
+        },
+        SpecialistRole.MARKET: {"average_basket", "transactions_per_day", "days_open_month"},
+        SpecialistRole.REGULATORY: set(),
+        SpecialistRole.EXECUTION: set(),
+        SpecialistRole.ADVERSARY: {"transactions_per_day", "gross_margin_pct", "monthly_rent"},
+    }
+
+    def research(
+        self,
+        venture: Venture,
+        *,
+        role: SpecialistRole | None = None,
+        mandate: str | None = None,
+    ) -> list[ResearchFinding]:
+        del mandate
         is_retail = any(
             token in venture.intake.business_type.lower() or token in venture.intake.idea.lower()
             for token in ("supermarket", "minimart", "retail", "shop", "grocery")
@@ -53,8 +83,11 @@ class OfflineResearchProvider(ResearchProvider):
         if not is_retail:
             return []
 
+        allowed = self.ROLE_KEYS.get(role) if role else None
         findings: list[ResearchFinding] = []
         for key, value, unit, claim in self.RETAIL_FIXTURE:
+            if allowed is not None and key not in allowed:
+                continue
             confidence = Confidence.LOW if key == "transactions_per_day" else Confidence.MEDIUM
             findings.append(
                 ResearchFinding(
@@ -66,23 +99,29 @@ class OfflineResearchProvider(ResearchProvider):
                     confidence=confidence,
                     source_title="Demo fixture — replace with live grounded research",
                     notes="Deterministic local fixture; not a factual statement about the user's market.",
+                    role=role,
                 )
             )
         return findings
 
 
 class GeminiGroundedResearchProvider(ResearchProvider):
-    """Live research provider using Gemini + Google Search grounding."""
+    """Live research provider using Gemini 3.7 Flash and Google Search grounding."""
 
     def __init__(self, model: str = "gemini-3.7-flash", api_key: str | None = None):
         from google import genai
 
-        self._genai = genai
         self.model = model
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
 
-    def research(self, venture: Venture) -> list[ResearchFinding]:
-        prompt = self._build_prompt(venture)
+    def research(
+        self,
+        venture: Venture,
+        *,
+        role: SpecialistRole | None = None,
+        mandate: str | None = None,
+    ) -> list[ResearchFinding]:
+        prompt = self._build_prompt(venture, role=role, mandate=mandate)
         from google.genai import types
 
         response = self.client.models.generate_content(
@@ -115,15 +154,33 @@ class GeminiGroundedResearchProvider(ResearchProvider):
                     source_title=str(raw.get("source_title") or "Gemini grounded research"),
                     source_url=source_url,
                     notes=raw.get("notes"),
+                    role=role,
                 )
             )
-        return [f for f in findings if f.assumption_key and f.claim]
+        return [finding for finding in findings if finding.assumption_key and finding.claim]
 
-    def _build_prompt(self, venture: Venture) -> str:
+    def _build_prompt(
+        self,
+        venture: Venture,
+        *,
+        role: SpecialistRole | None,
+        mandate: str | None,
+    ) -> str:
         intake = venture.intake
         keys = [item.key for item in venture.assumptions]
+        role_text = role.value if role else "general diligence"
+        policy = policy_for(role) if role else None
+        source_text = ", ".join(policy.preferred_sources) if policy else "best current sources"
+        official_text = (
+            "For every material regulatory/legal claim, use an official source URL or return no claim."
+            if policy and policy.official_required
+            else "Prefer primary/current sources over summaries."
+        )
         return f"""
-You are performing adversarial pre-launch diligence for a real founder. Search the current web.
+You are the {role_text} specialist inside Cogen, a persistent adversarial venture-underwriting system.
+Your job is narrow: {mandate or 'find evidence that materially changes the launch decision'}.
+Search the current web using Google Search grounding.
+
 Business idea: {intake.idea}
 Business type: {intake.business_type}
 Location: {intake.location}
@@ -132,17 +189,18 @@ Protected reserve: {intake.founder.protected_reserve}
 Owner income target: {intake.founder.target_monthly_owner_income}
 Existing assumption keys: {keys}
 
-Find evidence that could DISPROVE the business case before evidence that supports it. Research current
-costs, local competition, demand proxies, margins where defensibly ascertainable, registration and tax
-path, local/county permits, sector regulation, suppliers/service providers and execution dependencies.
-Never invent a fee, law, licence, supplier, professional, price or URL. If a value cannot be established,
-return null and explain the unknown.
+Source preference: {source_text}.
+{official_text}
+Attack the business case before supporting it. Do not invent a fee, law, licence, supplier, professional,
+price, review, statistic, market size or URL. If a material value cannot be established, either return null
+with the uncertainty explained or omit it. Do not convert model inference into observed evidence.
 
 Return ONLY a JSON array. Each object must contain:
-assumption_key, claim, value (number or null), unit, evidence_type (official|quote|listing|review|benchmark|observed|founder|model),
-confidence (low|medium|high|verified), source_title, source_url (URL or null), notes.
-Use the existing assumption keys when applicable. For additional regulatory/execution findings use keys
-prefixed regulatory_ or execution_. Prefer official sources for registration, tax and legal requirements.
+assumption_key, claim, value (number or null), unit, evidence_type
+(official|quote|listing|review|benchmark|observed|founder|model), confidence
+(low|medium|high|verified), source_title, source_url (URL or null), notes.
+Use existing assumption keys when applicable. Additional regulatory/execution findings must use keys
+prefixed regulatory_ or execution_.
 """.strip()
 
     @staticmethod
@@ -166,7 +224,9 @@ prefixed regulatory_ or execution_. Prefer official sources for registration, ta
             claimed = Confidence(str(raw).lower())
         except ValueError:
             claimed = Confidence.LOW
-        if source_url and grounded_urls and source_url not in grounded_urls:
+        if not source_url:
+            return min(claimed, Confidence.LOW, key=lambda item: list(Confidence).index(item))
+        if grounded_urls and source_url not in grounded_urls:
             return Confidence.LOW
         return claimed
 

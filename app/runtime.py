@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from app.repository import FirestoreRepository, SQLiteRepository, VentureRepository
+from app.repository import PostgresRepository, SQLiteRepository, VentureRepository
 from app.research import GeminiGroundedResearchProvider, OfflineResearchProvider, ResearchProvider
 from app.service import VentureService
 from app.settings import get_settings
@@ -9,12 +9,14 @@ from app.settings import get_settings
 @lru_cache
 def get_repository() -> VentureRepository:
     settings = get_settings()
-    if settings.database_backend.lower() == "firestore":
-        return FirestoreRepository(
-            project=settings.google_cloud_project,
-            database=settings.firestore_database,
-        )
-    return SQLiteRepository(settings.sqlite_path)
+    backend = settings.database_backend.lower()
+    if backend in {"postgres", "postgresql", "neon"}:
+        if not settings.database_url:
+            raise RuntimeError("DATABASE_BACKEND=postgres requires DATABASE_URL")
+        return PostgresRepository(settings.database_url)
+    if backend == "sqlite":
+        return SQLiteRepository(settings.sqlite_path)
+    raise RuntimeError(f"Unsupported DATABASE_BACKEND: {settings.database_backend}")
 
 
 @lru_cache

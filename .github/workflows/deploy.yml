@@ -1,0 +1,160 @@
+name: deploy-cloud-run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE_NAME: cogen
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install and verify
+        run: |
+          uv sync --extra dev --python 3.13
+          uv run ruff check app tests
+          uv run pytest
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Install gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Configure Artifact Registry auth
+        run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_ARTIFACT_REPOSITORY }}/cogen:${GITHUB_SHA}"
+          docker build --pull -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build Cloud Run environment file without logging secrets
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          from pathlib import Path
+
+          required = ["GEMINI_API_KEY", "DATABASE_URL"]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Missing required GitHub secrets: " + ", ".join(missing))
+
+          data = {
+              "APP_ENV": "production",
+              "DATABASE_BACKEND": "postgres",
+              "DATABASE_URL": os.environ["DATABASE_URL"],
+              "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"],
+              "GEMINI_MODEL": "gemini-3.7-flash",
+              "RESEARCH_MODE": "live",
+              "GOOGLE_CLOUD_PROJECT": "${{ vars.GCP_PROJECT_ID }}",
+              "GOOGLE_CLOUD_LOCATION": "${{ vars.GCP_REGION }}",
+          }
+          Path("/tmp/cogen-env.yaml").write_text(json.dumps(data))
+          PY
+
+      - name: Deploy to Cloud Run
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$SERVICE_NAME" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --image="${{ steps.image.outputs.uri }}" \
+            --service-account="${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}" \
+            --allow-unauthenticated \
+            --min-instances=0 \
+            --max-instances=3 \
+            --cpu=1 \
+            --memory=512Mi \
+            --concurrency=40 \
+            --timeout=300 \
+            --env-vars-file=/tmp/cogen-env.yaml \
+            --quiet
+
+      - name: Resolve service URL
+        id: service
+        shell: bash
+        run: |
+          URL="$(gcloud run services describe "$SERVICE_NAME" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+          test -n "$URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Cogen deployed to $URL"
+
+      - name: Smoke-test deployed service and Neon readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ steps.service.outputs.url }}"
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$URL/healthz"
+          echo
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$URL/readyz"
+          echo
+
+      - name: Run canonical live Gemini + Neon E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ steps.service.outputs.url }}"
+          curl --fail --silent --show-error \
+            --max-time 290 \
+            -X POST "$URL/api/demo" \
+            -H 'Content-Type: application/json' \
+            -o /tmp/cogen-live-demo.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/cogen-live-demo.json').read_text())
+          underwriting = data.get('underwriting') or {}
+          evidence = data.get('evidence') or []
+          print('LIVE_E2E_PASS')
+          print('venture_id=', data.get('id'))
+          print('decision=', underwriting.get('decision'))
+          print('evidence_count=', len(evidence))
+          print('simulation_runs=', underwriting.get('simulation_runs'))
+          if not data.get('id'):
+              raise SystemExit('live demo returned no venture id')
+          if underwriting.get('simulation_runs', 0) <= 0:
+              raise SystemExit('deterministic underwriting did not run')
+          PY
+
+      - name: Remove temporary env file
+        if: always()
+        run: rm -f /tmp/cogen-env.yaml /tmp/cogen-live-demo.json
