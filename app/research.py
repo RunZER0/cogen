@@ -43,16 +43,17 @@ class ResearchProvider(ABC):
 class OfflineResearchProvider(ResearchProvider):
     """Deterministic fixture provider for tests and no-key demos.
 
-    These values are deliberately marked DEMO and must never be represented as current market facts.
+    Values are deliberately marked DEMO and must never be represented as current market facts. Monetary
+    units are rendered in the Venture Twin's currency so the fixture cannot leak a country assumption.
     """
 
     RETAIL_FIXTURE = [
-        ("setup_costs", 1_300_000.0, "KES", "Illustrative opening setup + stock envelope"),
-        ("monthly_rent", 55_000.0, "KES/month", "Illustrative premises rent"),
-        ("monthly_payroll", 90_000.0, "KES/month", "Illustrative staffing cost"),
-        ("monthly_utilities", 35_000.0, "KES/month", "Illustrative utilities + operating overhead"),
+        ("setup_costs", 1_300_000.0, "currency", "Illustrative opening setup + stock envelope"),
+        ("monthly_rent", 55_000.0, "currency/month", "Illustrative premises rent"),
+        ("monthly_payroll", 90_000.0, "currency/month", "Illustrative staffing cost"),
+        ("monthly_utilities", 35_000.0, "currency/month", "Illustrative utilities + operating overhead"),
         ("gross_margin_pct", 0.18, "ratio", "Illustrative blended gross margin"),
-        ("average_basket", 600.0, "KES/transaction", "Illustrative average customer basket"),
+        ("average_basket", 600.0, "currency/transaction", "Illustrative average customer basket"),
         ("transactions_per_day", 120.0, "transactions/day", "UNVERIFIED demand/footfall assumption"),
         ("days_open_month", 30.0, "days/month", "Illustrative trading days"),
         ("shrinkage_pct", 0.02, "ratio", "Illustrative shrinkage/spoilage rate"),
@@ -90,9 +91,11 @@ class OfflineResearchProvider(ResearchProvider):
 
         allowed = self.ROLE_KEYS.get(role) if role else None
         findings: list[ResearchFinding] = []
-        for key, value, unit, claim in self.RETAIL_FIXTURE:
+        currency = venture.intake.monetary_unit
+        for key, value, unit_template, claim in self.RETAIL_FIXTURE:
             if allowed is not None and key not in allowed:
                 continue
+            unit = unit_template.replace("currency", currency)
             confidence = Confidence.LOW if key == "transactions_per_day" else Confidence.MEDIUM
             findings.append(
                 ResearchFinding(
@@ -197,7 +200,7 @@ class GeminiGroundedResearchProvider(ResearchProvider):
         policy = policy_for(role)
         source_text = ", ".join(policy.preferred_sources)
         official_text = (
-            "For every material regulatory/legal claim, use an official source URL or return no claim."
+            "For every material regulatory/legal claim, use a current primary official source URL from the authority that actually governs this venture or return no claim."
             if policy.official_required
             else "Prefer primary/current sources over summaries."
         )
@@ -211,6 +214,10 @@ is admitted. Search the current web using Google Search grounding.
 
 SOURCE POLICY: {source_text}.
 {official_text}
+Respect the venture's explicit country, subdivision/locality and currency. Never import laws, taxes, licences,
+fees, prices, wage norms or monetary units from another jurisdiction merely because they are easier to find.
+When the governing level is unclear, identify that uncertainty instead of guessing.
+
 Attack the business case before supporting it. Do not invent a fee, law, licence, supplier, professional,
 price, review, statistic, market size or URL. If a material value cannot be established, either return null
 with the uncertainty explained or omit it. Do not convert model inference or prior simulation into observed
@@ -221,7 +228,7 @@ assumption_key, claim, value (number or null), unit, evidence_type
 (official|quote|listing|review|benchmark|observed|founder|model), confidence
 (low|medium|high|verified), source_title, source_url (URL or null), notes.
 Use existing assumption keys when applicable. Additional regulatory/execution findings must use keys
-prefixed regulatory_ or execution_.
+prefixed regulatory_ or execution_. Monetary units must use the Venture Twin currency code.
 """.strip()
 
     @staticmethod
