@@ -30,12 +30,7 @@ class ContextBudget:
 
 
 class WorkingContextBuilder:
-    """Builds a bounded, materiality-first context from durable venture state.
-
-    Long-lived Cogen runs do not replay the chat transcript. The model receives founder constraints,
-    the highest-risk assumptions, the strongest/recent evidence relevant to the role, and the current
-    decision state. Everything else remains durable in the Venture Twin and can be retrieved later.
-    """
+    """Build a bounded, materiality-first context from durable Venture Twin state."""
 
     def __init__(self, budget: ContextBudget | None = None):
         self.budget = budget or ContextBudget()
@@ -53,20 +48,27 @@ class WorkingContextBuilder:
             reverse=True,
         )[: self.budget.max_evidence]
 
-        founder = venture.intake.founder
+        intake = venture.intake
+        founder = intake.founder
         lines = [
             f"ROLE: {role.value}",
             f"MANDATE: {mandate}",
+            "VENTURE JURISDICTION:",
+            f"- location_text: {intake.location}",
+            f"- locality: {intake.locality}",
+            f"- subdivision: {intake.subdivision}",
+            f"- country: {intake.country}",
+            f"- currency: {intake.monetary_unit}",
+            f"- locale: {intake.locale}",
             "FOUNDER CONSTRAINTS:",
-            f"- idea: {venture.intake.idea}",
-            f"- business_type: {venture.intake.business_type}",
-            f"- location: {venture.intake.location}",
+            f"- idea: {intake.idea}",
+            f"- business_type: {intake.business_type}",
             f"- available_capital: {founder.available_capital}",
             f"- protected_reserve: {founder.protected_reserve}",
             f"- debt_available: {founder.debt_available}",
             f"- target_monthly_owner_income: {founder.target_monthly_owner_income}",
             f"- max_acceptable_loss: {founder.max_acceptable_loss}",
-            f"- launch_target_months: {venture.intake.launch_target_months}",
+            f"- launch_target_months: {intake.launch_target_months}",
             "MATERIAL ASSUMPTIONS:",
         ]
         for item in assumptions:
