@@ -104,6 +104,8 @@ jobs:
             --image="${{ steps.image.outputs.uri }}" \
             --service-account="$GCP_RUNTIME_SERVICE_ACCOUNT" \
             --allow-unauthenticated \
+            --ingress=all \
+            --default-url \
             --min-instances=0 \
             --max-instances=3 \
             --cpu=1 \
@@ -112,6 +114,36 @@ jobs:
             --timeout=300 \
             --env-vars-file=/tmp/cogen-env.yaml \
             --quiet
+
+          # Make the two front-door requirements explicit even if an older revision/service
+          # carried restrictive settings.
+          gcloud run services update "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --ingress=all \
+            --default-url \
+            --quiet
+          gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --member="allUsers" \
+            --role="roles/run.invoker" \
+            --quiet
+
+      - name: Inspect Cloud Run service, traffic and IAM
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '--- SERVICE ---'
+          gcloud run services describe "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --format='yaml(metadata.name,metadata.annotations,spec.template.metadata.annotations,status.url,status.address,status.latestCreatedRevisionName,status.latestReadyRevisionName,status.traffic)'
+          echo '--- IAM ---'
+          gcloud run services get-iam-policy "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --format='yaml(bindings)'
 
       - name: Resolve serving Cloud Run URL
         id: service
@@ -127,12 +159,12 @@ jobs:
           echo "Canonical candidate: $CANONICAL"
           echo "Status candidate: $STATUS_URL"
 
-          for attempt in $(seq 1 15); do
+          for attempt in $(seq 1 10); do
             for candidate in "$CANONICAL" "$STATUS_URL"; do
               [ -n "$candidate" ] || continue
               code="$(curl --silent --output /tmp/health-probe.txt --write-out '%{http_code}' \
                 --connect-timeout 10 --max-time 20 "$candidate/healthz" || true)"
-              echo "Probe attempt $attempt: $candidate/healthz -> $code"
+              echo "Public probe $attempt: $candidate/healthz -> $code"
               if [ "$code" = "200" ]; then
                 echo "url=$candidate" >> "$GITHUB_OUTPUT"
                 echo "Serving Cogen URL: $candidate"
@@ -141,7 +173,28 @@ jobs:
             done
             sleep 3
           done
-          echo "No Cloud Run URL served Cogen /healthz" >&2
+
+          echo 'Public probe failed. Testing the service through authenticated gcloud proxy.'
+          gcloud run services proxy "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --port=9090 >/tmp/cogen-proxy.log 2>&1 &
+          PROXY_PID=$!
+          trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 10); do
+            code="$(curl --silent --output /tmp/proxy-health.txt --write-out '%{http_code}' \
+              --connect-timeout 3 --max-time 10 http://127.0.0.1:9090/healthz || true)"
+            echo "Authenticated proxy probe $attempt -> $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/proxy-health.txt
+              echo 'Container is healthy through authenticated proxy; public Cloud Run front door remains misconfigured.' >&2
+              exit 2
+            fi
+            sleep 2
+          done
+          echo '--- PROXY LOG ---'
+          cat /tmp/cogen-proxy.log || true
+          echo 'Neither public nor authenticated Cloud Run probe reached Cogen /healthz.' >&2
           exit 1
 
       - name: Smoke-test deployed service and Neon readiness
@@ -207,4 +260,4 @@ jobs:
 
       - name: Remove temporary files
         if: always()
-        run: rm -f /tmp/cogen-env.yaml /tmp/cogen-live-demo.json /tmp/specialists.json /tmp/validation.json /tmp/events.json /tmp/health-probe.txt
+        run: rm -f /tmp/cogen-env.yaml /tmp/cogen-live-demo.json /tmp/specialists.json /tmp/validation.json /tmp/events.json /tmp/health-probe.txt /tmp/proxy-health.txt /tmp/cogen-proxy.log
