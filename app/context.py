@@ -30,12 +30,7 @@ class ContextBudget:
 
 
 class WorkingContextBuilder:
-    """Builds a bounded, materiality-first context from durable venture state.
-
-    Long-lived Cogen runs do not replay the chat transcript. The model receives founder constraints,
-    the highest-risk assumptions, the strongest/recent evidence relevant to the role, and the current
-    decision state. Everything else remains durable in the Venture Twin and can be retrieved later.
-    """
+    """Build a bounded, jurisdiction-aware working set from durable venture state."""
 
     def __init__(self, budget: ContextBudget | None = None):
         self.budget = budget or ContextBudget()
@@ -54,13 +49,22 @@ class WorkingContextBuilder:
         )[: self.budget.max_evidence]
 
         founder = venture.intake.founder
+        jurisdiction = venture.intake.jurisdiction
         lines = [
             f"ROLE: {role.value}",
             f"MANDATE: {mandate}",
-            "FOUNDER CONSTRAINTS:",
+            "VENTURE / JURISDICTION:",
             f"- idea: {venture.intake.idea}",
             f"- business_type: {venture.intake.business_type}",
             f"- location: {venture.intake.location}",
+            f"- country_code: {jurisdiction.country_code}",
+            f"- country_name: {jurisdiction.country_name}",
+            f"- subdivision: {jurisdiction.subdivision}",
+            f"- locality: {jurisdiction.locality}",
+            f"- currency_code: {jurisdiction.currency_code}",
+            f"- locale: {jurisdiction.locale}",
+            f"- regulatory_scope: {jurisdiction.regulatory_scope}",
+            "FOUNDER CONSTRAINTS:",
             f"- available_capital: {founder.available_capital}",
             f"- protected_reserve: {founder.protected_reserve}",
             f"- debt_available: {founder.debt_available}",
