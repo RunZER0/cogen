@@ -14,9 +14,12 @@ class Settings(BaseSettings):
 
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.7-flash"
+    gemini_fallback_model: str | None = "gemini-3.6-flash"
+    gemini_attempts_per_model: int = 2
     research_mode: str = "offline"
     specialist_mode: str = "orchestrated"
     live_specialist_limit: int = 5
+    specialist_research_rounds: int = 2
 
     google_cloud_project: str | None = None
     google_cloud_location: str = "us-central1"
