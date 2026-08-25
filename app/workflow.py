@@ -14,6 +14,7 @@ from app.domain import (
     WorkflowStatus,
 )
 from app.engine import VentureEngine
+from app.evidence_resolution import reconcile_venture
 from app.orchestration import SpecialistOrchestrator
 from app.repository import VentureRepository
 from app.research import ResearchFinding
@@ -36,11 +37,7 @@ class SimulatedCrash(RuntimeError):
 
 
 class WorkflowRunner:
-    """Checkpointed, idempotent analysis workflow.
-
-    Completed phases are durably recorded. Research also checkpoints after each specialist, so a retry
-    does not pay to rerun roles whose report and candidate-evidence batch are already persisted.
-    """
+    """Checkpointed, idempotent analysis workflow with specialist-level recovery."""
 
     def __init__(
         self,
@@ -160,6 +157,7 @@ class WorkflowRunner:
                 raise RuntimeError("Research checkpoint missing")
             findings = [self._finding_from_dict(item) for item in batch.findings]
             venture = self.engine.ingest_research(venture, findings)
+            venture = reconcile_venture(venture)
             self.repository.save_venture(venture)
             self.state.event(
                 venture.id,
@@ -229,9 +227,8 @@ class WorkflowRunner:
             if role in completed_roles:
                 continue
             result = self.orchestrator.run_role(venture, workflow.id, role, seen=seen)
-            # run_role receives and mutates the shared `seen` set while deciding which
-            # candidates are fresh. Everything returned here has therefore already passed
-            # dedupe and must be checkpointed exactly once.
+            # run_role mutates `seen` while deciding freshness; every returned item has
+            # already passed dedupe and is checkpointed exactly once here.
             batch.findings.extend(asdict(item) for item in result.findings)
             batch.rejected.extend(result.rejected)
             batch.rejected = list(dict.fromkeys(batch.rejected))
