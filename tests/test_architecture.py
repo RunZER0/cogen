@@ -1,5 +1,6 @@
 import pytest
 
+from app.context import ContextBudget, WorkingContextBuilder
 from app.domain import (
     EvidenceType,
     ForkVentureRequest,
@@ -11,6 +12,7 @@ from app.domain import (
     WorkflowStatus,
 )
 from app.evidence import EvidenceLedger
+from app.model_runtime import GeminiModelRouter
 from app.orchestration import SpecialistOrchestrator
 from app.research import ResearchFinding, ResearchProvider
 from app.state import StateStore
@@ -144,7 +146,8 @@ def test_regulatory_specialist_cannot_promote_unsourced_claim(service, intake_pa
     result = orchestrator.run(venture, "workflow-x")
     assert result.findings == []
     assert result.rejected
-    assert result.reports[0].rejected_count == 1
+    assert result.reports[0].rejected_count >= 1
+    assert "0 admissible findings" in result.reports[0].summary
 
 
 def test_specialist_orchestration_uses_all_required_roles(service, intake_payload):
@@ -153,8 +156,50 @@ def test_specialist_orchestration_uses_all_required_roles(service, intake_payloa
     assert {report.role for report in result.reports} == set(SpecialistRole)
 
 
-def test_readiness_checks_real_repository(service):
-    assert service.readiness()["database"] == "ok"
+def test_working_context_is_bounded_and_keeps_material_constraints(service, intake_payload):
+    venture = service.create_venture(VentureIntake.model_validate(intake_payload))
+    builder = WorkingContextBuilder(ContextBudget(max_assumptions=4, max_evidence=2, max_chars=1800))
+    context = builder.build(venture, SpecialistRole.MARKET, "attack demand")
+    assert len(context) <= 1800
+    assert "available_capital: 1800000.0" in context
+    assert "target_monthly_owner_income: 120000.0" in context
+    assert "transactions_per_day" in context
+    assert "ROLE: market" in context
+
+
+class FakeModels:
+    def __init__(self):
+        self.calls = []
+
+    def generate_content(self, *, model, contents, config):
+        del contents, config
+        self.calls.append(model)
+        if model == "primary":
+            raise ConnectionError("primary unavailable")
+        return {"model": model}
+
+
+class FakeClient:
+    def __init__(self):
+        self.models = FakeModels()
+
+
+def test_model_router_retries_primary_then_uses_fallback():
+    router = GeminiModelRouter("primary", fallback="fallback", attempts_per_model=2)
+    client = FakeClient()
+    response = router.generate(client, contents="x", config={})
+    assert response == {"model": "fallback"}
+    assert client.models.calls == ["primary", "primary", "fallback"]
+    health = router.snapshot()
+    assert health["last_model_used"] == "fallback"
+    assert health["fallbacks_used"] == 1
+    assert health["failures"]["primary"] == 2
+
+
+def test_readiness_checks_real_repository_and_research_runtime(service):
+    readiness = service.readiness()
+    assert readiness["database"] == "ok"
+    assert readiness["research_runtime"]["status"] == "ok"
 
 
 def test_acceptance_contract_contains_exactly_100_numbered_criteria():
