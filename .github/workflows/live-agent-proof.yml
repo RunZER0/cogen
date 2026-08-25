@@ -19,6 +19,8 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-3.7-flash
+      GEMINI_FALLBACK_MODEL: gemini-3.6-flash
+      GEMINI_ATTEMPTS_PER_MODEL: "2"
       RESEARCH_MODE: live
       GOOGLE_CLOUD_PROJECT: cogen-506607
       GOOGLE_CLOUD_LOCATION: us-central1
@@ -93,6 +95,20 @@ jobs:
           PROMPT
           )
           timeout 900 agents-cli run -v "$PROMPT" 2>&1 | tee artifacts/austin-adk-trace.log
+
+          python - <<'PY'
+          from pathlib import Path
+          trace = Path("artifacts/austin-adk-trace.log").read_text(errors="replace")
+          fatal_markers = (
+              '"errorCode": "ServerError"',
+              '"errorCode": "ClientError"',
+              '"error_details"',
+          )
+          found = [marker for marker in fatal_markers if marker in trace]
+          if found:
+              raise SystemExit("ADK emitted fatal model error event despite CLI exit 0: " + ", ".join(found))
+          print("ADK_TRACE_HAS_NO_FATAL_MODEL_EVENT")
+          PY
 
       - name: Verify the persisted Venture Twin independently of the agent answer
         run: |
