@@ -27,6 +27,11 @@ def intake_payload():
         "idea": "Open a neighbourhood supermarket/minimart",
         "business_type": "supermarket retail",
         "location": "Ruiru, Kiambu County, Kenya",
+        "locality": "Ruiru",
+        "subdivision": "Kiambu County",
+        "country": "Kenya",
+        "currency": "KES",
+        "locale": "en-KE",
         "launch_target_months": 4,
         "founder": {
             "available_capital": 1_800_000,
