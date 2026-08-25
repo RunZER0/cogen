@@ -11,6 +11,12 @@ permissions:
 
 env:
   SERVICE_NAME: cogen
+  GCP_PROJECT_ID: cogen-506607
+  GCP_REGION: us-central1
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/257066508186/locations/global/workloadIdentityPools/github/providers/cogen-github
+  GCP_SERVICE_ACCOUNT: cogen-github-deployer@cogen-506607.iam.gserviceaccount.com
+  GCP_RUNTIME_SERVICE_ACCOUNT: cogen-runtime@cogen-506607.iam.gserviceaccount.com
+  GCP_ARTIFACT_REPOSITORY: cogen
 
 jobs:
   verify:
@@ -36,24 +42,24 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
 
       - name: Install gcloud
         uses: google-github-actions/setup-gcloud@v3
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
 
       - name: Configure Artifact Registry auth
-        run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 
       - name: Build and push image
         id: image
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_ARTIFACT_REPOSITORY }}/cogen:${GITHUB_SHA}"
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GCP_ARTIFACT_REPOSITORY}/cogen:${GITHUB_SHA}"
           docker build --pull -t "$IMAGE" .
           docker push "$IMAGE"
           echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
@@ -81,8 +87,8 @@ jobs:
               "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"],
               "GEMINI_MODEL": "gemini-3.7-flash",
               "RESEARCH_MODE": "live",
-              "GOOGLE_CLOUD_PROJECT": "${{ vars.GCP_PROJECT_ID }}",
-              "GOOGLE_CLOUD_LOCATION": "${{ vars.GCP_REGION }}",
+              "GOOGLE_CLOUD_PROJECT": os.environ["GCP_PROJECT_ID"],
+              "GOOGLE_CLOUD_LOCATION": os.environ["GCP_REGION"],
           }
           Path("/tmp/cogen-env.yaml").write_text(json.dumps(data))
           PY
@@ -92,10 +98,10 @@ jobs:
         run: |
           set -euo pipefail
           gcloud run deploy "$SERVICE_NAME" \
-            --project="${{ vars.GCP_PROJECT_ID }}" \
-            --region="${{ vars.GCP_REGION }}" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
             --image="${{ steps.image.outputs.uri }}" \
-            --service-account="${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}" \
+            --service-account="$GCP_RUNTIME_SERVICE_ACCOUNT" \
             --allow-unauthenticated \
             --min-instances=0 \
             --max-instances=3 \
@@ -111,8 +117,8 @@ jobs:
         shell: bash
         run: |
           URL="$(gcloud run services describe "$SERVICE_NAME" \
-            --project="${{ vars.GCP_PROJECT_ID }}" \
-            --region="${{ vars.GCP_REGION }}" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
             --format='value(status.url)')"
           test -n "$URL"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
