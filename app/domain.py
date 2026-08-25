@@ -153,9 +153,34 @@ class VentureIntake(BaseModel):
     idea: str = Field(min_length=3, max_length=500)
     business_type: str = Field(default="general", min_length=2, max_length=100)
     location: str = Field(min_length=2, max_length=200)
+    country: str | None = Field(default=None, min_length=2, max_length=100)
+    subdivision: str | None = Field(default=None, max_length=120)
+    locality: str | None = Field(default=None, max_length=120)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    locale: str | None = Field(default=None, max_length=32)
     launch_target_months: int = Field(default=4, ge=1, le=60)
     founder: FounderProfile
     notes: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str | None) -> str | None:
+        return value.upper() if value else None
+
+    @field_validator("country", "subdivision", "locality")
+    @classmethod
+    def normalize_geography(cls, value: str | None) -> str | None:
+        return value.strip() if value else None
+
+    @property
+    def monetary_unit(self) -> str:
+        return self.currency or "LOCAL"
+
+    @property
+    def jurisdiction_label(self) -> str:
+        parts = [self.locality, self.subdivision, self.country]
+        resolved = [part for part in parts if part]
+        return ", ".join(resolved) if resolved else self.location
 
 
 class Evidence(BaseModel):
