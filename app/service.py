@@ -22,6 +22,7 @@ from app.domain import (
 )
 from app.engine import VentureEngine
 from app.evidence import invalidate_dependents
+from app.evidence_resolution import reconcile_venture
 from app.forks import fork_venture
 from app.intake import plan_intake
 from app.orchestration import SpecialistOrchestrator
@@ -151,10 +152,13 @@ class VentureService:
             source_url=request.source_url,
             notes=request.notes,
         )
+        # The engine records the evidence. Then the deterministic reducer chooses which admitted
+        # evidence is allowed to drive the canonical assumption value. A weaker later claim remains
+        # in history but cannot silently replace a stronger quote/observation/official source.
         venture = self.engine.add_evidence(venture, evidence)
+        venture = reconcile_venture(venture)
         invalidated = invalidate_dependents(venture, request.assumption_key)
-        if invalidated:
-            venture = self.engine.underwrite(venture)
+        venture = self.engine.underwrite(venture)
         self.repository.save_venture(venture)
         self.state.event(
             venture.id,
@@ -164,6 +168,7 @@ class VentureService:
                 "evidence_id": evidence.id,
                 "assumption_key": request.assumption_key,
                 "invalidated": invalidated,
+                "canonical_value": venture.assumption_map()[request.assumption_key].value,
             },
             actor="founder",
         )
