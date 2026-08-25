@@ -41,18 +41,15 @@ class ResearchProvider(ABC):
 
 
 class OfflineResearchProvider(ResearchProvider):
-    """Deterministic fixture provider for tests and no-key demos.
-
-    These values are deliberately marked DEMO and must never be represented as current market facts.
-    """
+    """Deterministic fixture provider for tests and no-key demos only."""
 
     RETAIL_FIXTURE = [
-        ("setup_costs", 1_300_000.0, "KES", "Illustrative opening setup + stock envelope"),
-        ("monthly_rent", 55_000.0, "KES/month", "Illustrative premises rent"),
-        ("monthly_payroll", 90_000.0, "KES/month", "Illustrative staffing cost"),
-        ("monthly_utilities", 35_000.0, "KES/month", "Illustrative utilities + operating overhead"),
+        ("setup_costs", 1_300_000.0, "money", "Illustrative opening setup + stock envelope"),
+        ("monthly_rent", 55_000.0, "money/month", "Illustrative premises rent"),
+        ("monthly_payroll", 90_000.0, "money/month", "Illustrative staffing cost"),
+        ("monthly_utilities", 35_000.0, "money/month", "Illustrative utilities + operating overhead"),
         ("gross_margin_pct", 0.18, "ratio", "Illustrative blended gross margin"),
-        ("average_basket", 600.0, "KES/transaction", "Illustrative average customer basket"),
+        ("average_basket", 600.0, "money/transaction", "Illustrative average customer basket"),
         ("transactions_per_day", 120.0, "transactions/day", "UNVERIFIED demand/footfall assumption"),
         ("days_open_month", 30.0, "days/month", "Illustrative trading days"),
         ("shrinkage_pct", 0.02, "ratio", "Illustrative shrinkage/spoilage rate"),
@@ -88,11 +85,13 @@ class OfflineResearchProvider(ResearchProvider):
         if not is_retail:
             return []
 
+        currency = venture.intake.jurisdiction.money_unit()
         allowed = self.ROLE_KEYS.get(role) if role else None
         findings: list[ResearchFinding] = []
-        for key, value, unit, claim in self.RETAIL_FIXTURE:
+        for key, value, unit_template, claim in self.RETAIL_FIXTURE:
             if allowed is not None and key not in allowed:
                 continue
+            unit = unit_template.replace("money", currency)
             confidence = Confidence.LOW if key == "transactions_per_day" else Confidence.MEDIUM
             findings.append(
                 ResearchFinding(
@@ -103,7 +102,7 @@ class OfflineResearchProvider(ResearchProvider):
                     evidence_type=EvidenceType.DEMO,
                     confidence=confidence,
                     source_title="Demo fixture — replace with live grounded research",
-                    notes="Deterministic local fixture; not a factual statement about the user's market.",
+                    notes="Deterministic fixture; not a factual statement about the user's market or currency scale.",
                     role=role,
                 )
             )
@@ -197,11 +196,12 @@ class GeminiGroundedResearchProvider(ResearchProvider):
         policy = policy_for(role)
         source_text = ", ".join(policy.preferred_sources)
         official_text = (
-            "For every material regulatory/legal claim, use an official source URL or return no claim."
+            "For every material regulatory/legal claim, use the competent official source for the exact jurisdictional level or return no claim."
             if policy.official_required
             else "Prefer primary/current sources over summaries."
         )
         working_context = self.context_builder.build(venture, role, mandate)
+        jurisdiction = venture.intake.jurisdiction
         return f"""
 You are a scoped research specialist inside Cogen, a persistent adversarial venture-underwriting system.
 You do not own venture state. You return candidate evidence; deterministic evidence policy decides what
@@ -209,12 +209,26 @@ is admitted. Search the current web using Google Search grounding.
 
 {working_context}
 
+JURISDICTION RULES:
+- Treat country, subdivision/state/province and locality as separate legal/market layers.
+- Target country code: {jurisdiction.country_code or 'UNRESOLVED'}.
+- Target subdivision: {jurisdiction.subdivision or 'UNRESOLVED'}.
+- Target locality: {jurisdiction.locality or venture.intake.location}.
+- Operating currency: {jurisdiction.currency_code or 'UNRESOLVED'}.
+- Never import requirements, agencies, taxes, licences, currency or market benchmarks from another country.
+- For regulatory work, identify the competent authority for each applicable national/federal,
+  state/provincial/regional, municipal/local and sector-specific obligation.
+- If the location could refer to multiple countries or the currency/jurisdiction is unresolved, return the
+  uncertainty rather than assuming the developer's or model's home country.
+
 SOURCE POLICY: {source_text}.
 {official_text}
 Attack the business case before supporting it. Do not invent a fee, law, licence, supplier, professional,
 price, review, statistic, market size or URL. If a material value cannot be established, either return null
 with the uncertainty explained or omit it. Do not convert model inference or prior simulation into observed
 evidence. Prefer evidence capable of resolving a critical or high-impact unknown over low-value background.
+Financial values must use the venture's operating currency unless the source itself quotes another currency,
+in which case label that currency explicitly and do not silently convert it.
 
 Return ONLY a JSON array. Each object must contain:
 assumption_key, claim, value (number or null), unit, evidence_type
