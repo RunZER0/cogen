@@ -229,12 +229,10 @@ class WorkflowRunner:
             if role in completed_roles:
                 continue
             result = self.orchestrator.run_role(venture, workflow.id, role, seen=seen)
-            for item in result.findings:
-                key = self._finding_key(item)
-                if key in seen:
-                    continue
-                seen.add(key)
-                batch.findings.append(asdict(item))
+            # run_role receives and mutates the shared `seen` set while deciding which
+            # candidates are fresh. Everything returned here has therefore already passed
+            # dedupe and must be checkpointed exactly once.
+            batch.findings.extend(asdict(item) for item in result.findings)
             batch.rejected.extend(result.rejected)
             batch.rejected = list(dict.fromkeys(batch.rejected))
             self.state.save_research_batch(batch)
