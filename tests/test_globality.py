@@ -78,7 +78,8 @@ def test_us_venture_has_no_kenya_specific_core_language(service):
     assert "county licence" not in rendered
     assert "county license" not in rendered
     assert "usd/month" in rendered
-    assert "state/provincial/regional" in rendered
+    assert "state/provincial" in rendered
+    assert "local" in rendered
 
 
 def test_bounded_context_carries_jurisdiction_and_currency(service):
