@@ -24,7 +24,13 @@ POLICIES: dict[SpecialistRole, SourcePolicy] = {
     ),
     SpecialistRole.REGULATORY: SourcePolicy(
         role=SpecialistRole.REGULATORY,
-        preferred_sources=("official regulator", "official county", "official registry", "statute or rule"),
+        preferred_sources=(
+            "official national or federal authority",
+            "official state, province or regional authority",
+            "official municipal or local authority",
+            "official business registry",
+            "statute, regulation or rule",
+        ),
         official_required=True,
     ),
     SpecialistRole.EXECUTION: SourcePolicy(
