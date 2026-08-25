@@ -5,6 +5,8 @@ from app.domain import IntakeDraft, IntakeDraftRequest, utc_now
 
 MATERIAL_FIELDS = (
     "location",
+    "country",
+    "currency",
     "available_capital",
     "protected_reserve",
     "target_monthly_owner_income",
@@ -13,7 +15,9 @@ MATERIAL_FIELDS = (
 )
 
 QUESTIONS = {
-    "location": "Where would this business operate? Give the town/area if you know it.",
+    "location": "Where would this business operate? Give the city/town/area if you know it.",
+    "country": "Which country governs this venture? If the location is unambiguous I can infer it, but I will not guess an ambiguous place.",
+    "currency": "Which currency should I use for the venture model? Use the ISO code if you know it, for example USD, EUR, GBP, AUD or CNY.",
     "available_capital": "How much money can you actually put into this venture?",
     "protected_reserve": "How much of that money must remain untouched as your safety reserve?",
     "target_monthly_owner_income": "What monthly income must the business eventually pay you?",
@@ -26,6 +30,8 @@ def plan_intake(request: IntakeDraftRequest, existing: IntakeDraft | None = None
     draft = existing or IntakeDraft(idea=request.idea)
     draft.idea = request.idea
     draft.known.update(request.known)
+    if isinstance(draft.known.get("currency"), str):
+        draft.known["currency"] = draft.known["currency"].upper()
     missing = [field for field in MATERIAL_FIELDS if draft.known.get(field) in (None, "")]
     draft.missing_material_fields = missing
     draft.next_question = QUESTIONS[missing[0]] if missing else None
