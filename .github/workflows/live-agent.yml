@@ -47,7 +47,8 @@ jobs:
           test -n "$DATABASE_URL"
           uv sync --extra dev --python 3.13
           uv run pytest
-          uvx google-agents-cli cmd-info --json
+          uvx google-agents-cli --help >/tmp/agents-cli-help.txt
+          grep -q 'run' /tmp/agents-cli-help.txt
 
       - name: Run actual Google ADK Cogen agent on Austin coffee-shop venture
         id: agent
