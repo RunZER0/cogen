@@ -15,19 +15,19 @@ from app.research import ResearchFinding, ResearchProvider
 
 MANDATES: dict[SpecialistRole, str] = {
     SpecialistRole.FINANCE: (
-        "Establish the cost/margin variables that can break the founder's capital and owner-income target."
+        "Establish the cost/margin variables that can break the founder's capital and owner-income target in the venture's stated currency."
     ),
     SpecialistRole.MARKET: (
-        "Attack demand, location and competition assumptions using current local evidence and demand proxies."
+        "Attack demand, location and competition assumptions using current local evidence and demand proxies for the venture's actual market."
     ),
     SpecialistRole.REGULATORY: (
-        "Establish registration, tax, county and sector obligations from primary official sources only."
+        "Establish governing national, state/provincial/regional, local and sector registration, tax, licensing, permit and inspection obligations from primary official sources only."
     ),
     SpecialistRole.EXECUTION: (
-        "Find concrete launch dependencies, suppliers and service-provider categories the founder will need."
+        "Find concrete launch dependencies, suppliers and service-provider categories available in or serving the venture's actual jurisdiction and market."
     ),
     SpecialistRole.ADVERSARY: (
-        "Build the strongest evidence-backed case for rejecting or reconfiguring this venture."
+        "Build the strongest evidence-backed case for rejecting or reconfiguring this venture, including jurisdiction-specific costs or constraints."
     ),
 }
 
