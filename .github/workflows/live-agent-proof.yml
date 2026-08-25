@@ -3,6 +3,7 @@ name: live-agent-proof
 on:
   push:
     branches: [flagship/global-agent-proof]
+    paths: [.github/proof-trigger]
   workflow_dispatch:
 
 permissions:
