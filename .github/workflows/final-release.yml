@@ -6,6 +6,10 @@ on:
       - .github/workflows/final-release.yml
   workflow_dispatch:
 
+concurrency:
+  group: cogen-final-release-main
+  cancel-in-progress: true
+
 permissions:
   contents: read
   id-token: write
@@ -21,6 +25,9 @@ env:
   GCP_ARTIFACT_REPOSITORY: cogen
   GEMINI_MODEL: gemini-3.5-flash
   GEMINI_FALLBACK_MODEL: gemini-3.5-flash-lite
+  GEMINI_SEARCH_GROUNDING: "false"
+  GEMINI_ATTEMPTS_PER_MODEL: "1"
+  SPECIALIST_RESEARCH_ROUNDS: "1"
 
 jobs:
   release:
@@ -84,6 +91,9 @@ jobs:
             "GOOGLE_GENAI_USE_VERTEXAI": "false",
             "GEMINI_MODEL": os.environ["GEMINI_MODEL"],
             "GEMINI_FALLBACK_MODEL": os.environ["GEMINI_FALLBACK_MODEL"],
+            "GEMINI_SEARCH_GROUNDING": os.environ["GEMINI_SEARCH_GROUNDING"],
+            "GEMINI_ATTEMPTS_PER_MODEL": os.environ["GEMINI_ATTEMPTS_PER_MODEL"],
+            "SPECIALIST_RESEARCH_ROUNDS": os.environ["SPECIALIST_RESEARCH_ROUNDS"],
             "RESEARCH_PROVIDER": "gemini",
             "RESEARCH_MODE": "live",
             "SPECIALIST_MODE": "orchestrated",
@@ -128,6 +138,9 @@ jobs:
             -e GOOGLE_GENAI_USE_VERTEXAI=false \
             -e GEMINI_MODEL="$GEMINI_MODEL" \
             -e GEMINI_FALLBACK_MODEL="$GEMINI_FALLBACK_MODEL" \
+            -e GEMINI_SEARCH_GROUNDING="$GEMINI_SEARCH_GROUNDING" \
+            -e GEMINI_ATTEMPTS_PER_MODEL="$GEMINI_ATTEMPTS_PER_MODEL" \
+            -e SPECIALIST_RESEARCH_ROUNDS="$SPECIALIST_RESEARCH_ROUNDS" \
             -e RESEARCH_PROVIDER=gemini \
             -e RESEARCH_MODE=live \
             -e SPECIALIST_MODE=orchestrated \
@@ -174,7 +187,7 @@ jobs:
             --data-binary @/tmp/intake.json -o /tmp/created.json
           VID="$(python -c "import json; print(json.load(open('/tmp/created.json'))['id'])")"
           echo "venture_id=$VID" >> "$GITHUB_OUTPUT"
-          CODE="$(curl -sS --max-time 290 -X POST "$URL/api/ventures/$VID/analysis/sync" \
+          CODE="$(curl -sS --max-time 180 -X POST "$URL/api/ventures/$VID/analysis/sync" \
             -o /tmp/analysis.json -w '%{http_code}' || true)"
           echo "ANALYSIS_HTTP_CODE=$CODE"
           if [ "$CODE" != 200 ]; then
@@ -218,7 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           VID="${{ steps.live.outputs.venture_id }}"
-          curl -fsS --no-buffer --max-time 180 \
+          curl -fsS --no-buffer --max-time 120 \
             -X POST "http://127.0.0.1:8080/api/ventures/$VID/agent/message" \
             -H 'Content-Type: application/json' \
             -d '{"message":"Use inspect_venture now, then tell me the current decision in one concise sentence. Do not start new research."}' \
@@ -304,6 +317,7 @@ jobs:
         run: |
           echo "MODEL=$GEMINI_MODEL"
           echo "FALLBACK_MODEL=$GEMINI_FALLBACK_MODEL"
+          echo "GROUNDING=$GEMINI_SEARCH_GROUNDING"
           echo "PUBLIC_URL=${{ steps.public.outputs.url }}"
           gcloud run services describe "$SERVICE_NAME" --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
             --format='value(status.latestReadyRevisionName)' || true
