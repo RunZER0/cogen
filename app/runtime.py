@@ -41,8 +41,8 @@ def get_research_provider() -> ResearchProvider:
             # the prior, already-tested single-completion providers below untouched.
             if provider == "openrouter" and not settings.openrouter_api_key:
                 raise RuntimeError("SPECIALIST_MODE=agentic with RESEARCH_PROVIDER=openrouter requires OPENROUTER_API_KEY")
-            if provider == "gemini" and not settings.gemini_api_key:
-                raise RuntimeError("SPECIALIST_MODE=agentic with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY")
+            if provider == "gemini" and not (settings.gemini_api_key or settings.google_genai_use_vertexai):
+                raise RuntimeError("SPECIALIST_MODE=agentic with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY or Vertex AI")
             if not settings.tavily_api_key:
                 raise RuntimeError("SPECIALIST_MODE=agentic requires TAVILY_API_KEY for the search_web tool")
             return AgenticSpecialistResearchProvider(settings)
@@ -64,11 +64,11 @@ def get_research_provider() -> ResearchProvider:
             )
         if provider != "gemini":
             raise RuntimeError(f"Unsupported RESEARCH_PROVIDER: {settings.research_provider}")
-        if not settings.gemini_api_key:
-            raise RuntimeError("RESEARCH_MODE=live with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY")
+        if not (settings.gemini_api_key or settings.google_genai_use_vertexai):
+            raise RuntimeError("RESEARCH_MODE=live with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY or Vertex AI")
         return GeminiGroundedResearchProvider(
             model=settings.gemini_model,
-            api_key=settings.gemini_api_key,
+            api_key=None if settings.google_genai_use_vertexai else settings.gemini_api_key,
             fallback_model=settings.gemini_fallback_model,
             attempts_per_model=settings.gemini_attempts_per_model,
         )
