@@ -1,0 +1,192 @@
+name: deadline-safe-release
+
+on:
+  push:
+    paths:
+      - .github/workflows/deadline-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE_NAME: cogen-hackathon
+  GCP_PROJECT_ID: cogen-506607
+  GCP_PROJECT_NUMBER: "257066508186"
+  GCP_REGION: us-central1
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/257066508186/locations/global/workloadIdentityPools/github/providers/cogen-github
+  GCP_SERVICE_ACCOUNT: cogen-github-deployer@cogen-506607.iam.gserviceaccount.com
+  GCP_RUNTIME_SERVICE_ACCOUNT: cogen-runtime@cogen-506607.iam.gserviceaccount.com
+  GCP_ARTIFACT_REPOSITORY: cogen
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Install gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Build and push current main
+        id: image
+        run: |
+          set -euo pipefail
+          : "${GEMINI_API_KEY:?missing key}"
+          : "${DATABASE_URL:?missing db}"
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GCP_ARTIFACT_REPOSITORY}/cogen:deadline-${GITHUB_SHA}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+      - name: Deploy fresh Cloud Run service
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('/tmp/env.json').write_text(json.dumps({
+            'APP_ENV':'production',
+            'DATABASE_BACKEND':'postgres',
+            'DATABASE_URL':os.environ['DATABASE_URL'],
+            'GEMINI_API_KEY':os.environ['GEMINI_API_KEY'],
+            'GOOGLE_API_KEY':os.environ['GEMINI_API_KEY'],
+            'GOOGLE_GENAI_USE_VERTEXAI':'false',
+            'GEMINI_MODEL':'gemini-3.5-flash',
+            'GEMINI_FALLBACK_MODEL':'gemini-3.5-flash-lite',
+            'GEMINI_ATTEMPTS_PER_MODEL':'1',
+            'RESEARCH_PROVIDER':'gemini',
+            'RESEARCH_MODE':'offline',
+            'SPECIALIST_MODE':'orchestrated',
+            'SPECIALIST_RESEARCH_ROUNDS':'1',
+            'GOOGLE_CLOUD_PROJECT':os.environ['GCP_PROJECT_ID'],
+            'GOOGLE_CLOUD_LOCATION':os.environ['GCP_REGION'],
+          }))
+          PY
+          gcloud run deploy "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --image="${{ steps.image.outputs.uri }}" \
+            --service-account="$GCP_RUNTIME_SERVICE_ACCOUNT" \
+            --no-invoker-iam-check --ingress=all --default-url \
+            --no-cpu-throttling --min-instances=0 --max-instances=3 \
+            --cpu=1 --memory=512Mi --concurrency=40 --timeout=300 \
+            --env-vars-file=/tmp/env.json --quiet
+          gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --member=allUsers --role=roles/run.invoker --quiet || true
+          gcloud run services describe "$SERVICE_NAME" --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format='yaml(status.latestReadyRevisionName,status.traffic,status.url,metadata.annotations)'
+      - name: Verify public URL
+        id: public
+        run: |
+          set -euo pipefail
+          CANONICAL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
+          LEGACY="$(gcloud run services describe "$SERVICE_NAME" --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --format='value(status.url)')"
+          for URL in "$CANONICAL" "$LEGACY"; do
+            echo "probing $URL"
+            for n in 1 2 3 4 5; do
+              code="$(curl -sS --max-time 20 -o /tmp/h -w '%{http_code}' "$URL/healthz" || true)"
+              echo "$n -> $code"
+              if [ "$code" = 200 ]; then
+                echo "url=$URL" >> "$GITHUB_OUTPUT"
+                echo "PUBLIC_URL=$URL"
+                exit 0
+              fi
+              sleep 2
+            done
+          done
+          echo 'No public URL reached container' >&2
+          exit 1
+      - name: Public demo + API smoke
+        id: demo
+        run: |
+          set -euo pipefail
+          URL='${{ steps.public.outputs.url }}'
+          curl -fsS "$URL/readyz" | tee /tmp/ready.json
+          code="$(curl -sS --max-time 90 -X POST "$URL/api/demo" -o /tmp/demo.json -w '%{http_code}')"
+          echo "DEMO_HTTP=$code"
+          test "$code" = 201
+          VID="$(python -c "import json;d=json.load(open('/tmp/demo.json'));print(d['id'])")"
+          echo "venture_id=$VID" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/demo.json')); u=d.get('underwriting') or {}
+          print('PUBLIC_DEMO_PASS', 'decision=',u.get('decision'),'evidence=',len(d.get('evidence') or []),'runs=',u.get('simulation_runs'))
+          assert d.get('underwriting') is not None
+          assert len(d.get('evidence') or []) > 0
+          PY
+          for suffix in specialists validation events timeline subagents forks contradictions narrative todos sandbox; do
+            curl -fsS "$URL/api/ventures/$VID/$suffix" -o "/tmp/$suffix.json"
+            echo "PUBLIC_${suffix^^}_PASS"
+          done
+      - name: Real Gemini ADK smoke
+        run: |
+          set -euo pipefail
+          URL='${{ steps.public.outputs.url }}'
+          VID='${{ steps.demo.outputs.venture_id }}'
+          code="$(curl -sS --max-time 120 -X POST "$URL/api/ventures/$VID/agent/message" \
+            -H 'Content-Type: application/json' \
+            -d '{"message":"Use inspect_venture, then give me the current decision and biggest risk in two short sentences."}' \
+            -o /tmp/agent.txt -w '%{http_code}' || true)"
+          cat /tmp/agent.txt
+          test "$code" = 200
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"final"' /tmp/agent.txt
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"done"' /tmp/agent.txt
+          echo PUBLIC_GEMINI_ADK_PASS
+      - name: Browser audit
+        run: |
+          set -euo pipefail
+          URL='${{ steps.public.outputs.url }}'
+          VID='${{ steps.demo.outputs.venture_id }}'
+          docker run --rm -i -e BASE_URL="$URL" -e VENTURE_ID="$VID" --entrypoint python "${{ steps.image.outputs.uri }}" - <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+          base=os.environ['BASE_URL']; vid=os.environ['VENTURE_ID']
+          errors=[]; bad=[]
+          with sync_playwright() as p:
+              b=p.chromium.launch(headless=True,args=['--no-sandbox'])
+              page=b.new_page(viewport={'width':1440,'height':1000})
+              page.on('console',lambda m: errors.append(m.text) if m.type=='error' else None)
+              page.on('response',lambda r: bad.append((r.status,r.url)) if r.url.startswith(base) and r.status>=400 else None)
+              page.goto(base+'/',wait_until='networkidle',timeout=60000)
+              assert page.title()=='Cogen — Venture Twin'
+              assert page.get_by_role('button',name='Load demo').is_visible()
+              assert page.get_by_role('link',name='New venture').is_visible()
+              for tab in ['position','agent','model','evidence','sandbox','roadmap','forks']:
+                  page.goto(f'{base}/#/v/{vid}/{tab}',wait_until='networkidle',timeout=60000)
+                  assert page.locator('body').is_visible()
+                  print('BROWSER_'+tab.upper()+'_PASS')
+              page.goto(base+'/#/new',wait_until='networkidle',timeout=60000)
+              page.locator('textarea').fill('Open a small neighborhood bakery')
+              page.locator('input').fill('bakery retail')
+              page.get_by_role('button',name='Begin').click()
+              page.wait_for_selector('.qcard input',timeout=30000)
+              print('BROWSER_INTAKE_PASS')
+              mobile=b.new_page(viewport={'width':390,'height':844})
+              mobile.goto(base+'/',wait_until='networkidle',timeout=60000)
+              assert mobile.get_by_role('button',name='Load demo').is_visible()
+              print('BROWSER_MOBILE_PASS')
+              b.close()
+          if bad:
+              print('HTTP_ERRORS',bad); raise SystemExit(1)
+          if errors:
+              print('CONSOLE_ERRORS',errors); raise SystemExit(1)
+          print('PUBLIC_BROWSER_PASS')
+          PY
+      - name: Release URL
+        run: |
+          echo '========================================='
+          echo 'COGEN_HACKATHON_URL=${{ steps.public.outputs.url }}'
+          echo 'CLOUD_RUN_SERVICE=cogen-hackathon'
+          echo 'GEMINI_MODEL=gemini-3.5-flash'
+          echo '========================================='
