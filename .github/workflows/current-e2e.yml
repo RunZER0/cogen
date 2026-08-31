@@ -1,0 +1,93 @@
+name: current-live-e2e
+
+on:
+  push:
+    paths:
+      - .github/workflows/current-e2e.yml
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: production
+      DATABASE_BACKEND: postgres
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_GENAI_USE_VERTEXAI: "false"
+      GEMINI_MODEL: gemini-3.5-flash
+      GEMINI_FALLBACK_MODEL: gemini-3.5-flash-lite
+      GEMINI_ATTEMPTS_PER_MODEL: "1"
+      RESEARCH_PROVIDER: gemini
+      RESEARCH_MODE: live
+      SPECIALIST_MODE: orchestrated
+      SPECIALIST_RESEARCH_ROUNDS: "1"
+      GOOGLE_CLOUD_PROJECT: cogen-506607
+      GOOGLE_CLOUD_LOCATION: us-central1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: uv sync --extra dev --python 3.13
+      - name: Start app
+        run: |
+          set -euo pipefail
+          nohup uv run uvicorn app.main:app --host 127.0.0.1 --port 8080 >/tmp/cogen.log 2>&1 &
+          echo $! >/tmp/pid
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/tmp/ready.json; then cat /tmp/ready.json; break; fi
+            sleep 2
+          done
+      - name: Live underwriting
+        id: live
+        run: |
+          set -euo pipefail
+          cat >/tmp/intake.json <<'JSON'
+          {"idea":"Open a neighbourhood supermarket/minimart","business_type":"supermarket retail","location":"Ruiru, Kiambu County, Kenya","locality":"Ruiru","subdivision":"Kiambu County","country":"Kenya","currency":"KES","locale":"en-KE","launch_target_months":4,"founder":{"available_capital":1800000,"protected_reserve":150000,"debt_available":0,"target_monthly_owner_income":120000,"max_acceptable_loss":600000,"time_commitment":"full-time","experience":"deadline release audit"}}
+          JSON
+          curl -fsS -X POST http://127.0.0.1:8080/api/ventures -H 'Content-Type: application/json' --data-binary @/tmp/intake.json -o /tmp/created.json
+          VID="$(python -c "import json;print(json.load(open('/tmp/created.json'))['id'])")"
+          echo "venture_id=$VID" >> "$GITHUB_OUTPUT"
+          code="$(curl -sS --max-time 290 -X POST "http://127.0.0.1:8080/api/ventures/$VID/analysis/sync" -o /tmp/analysis.json -w '%{http_code}' || true)"
+          echo "ANALYSIS_HTTP=$code"
+          cat /tmp/analysis.json
+          test "$code" = 200
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/analysis.json')); u=d.get('underwriting') or {}
+          print('\nLIVE_ANALYSIS_PASS', 'decision=',u.get('decision'),'evidence=',len(d.get('evidence') or []),'runs=',u.get('simulation_runs'))
+          assert d.get('id')
+          assert d.get('evidence')
+          PY
+      - name: ADK chat
+        run: |
+          set -euo pipefail
+          VID='${{ steps.live.outputs.venture_id }}'
+          code="$(curl -sS --max-time 180 -X POST "http://127.0.0.1:8080/api/ventures/$VID/agent/message" -H 'Content-Type: application/json' -d '{"message":"Use inspect_venture now, then tell me the current decision in one concise sentence. Do not start new research."}' -o /tmp/agent.txt -w '%{http_code}' || true)"
+          cat /tmp/agent.txt
+          test "$code" = 200
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"final"' /tmp/agent.txt
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"done"' /tmp/agent.txt
+          echo ADK_CHAT_PASS
+      - name: Demo endpoint
+        run: |
+          set -euo pipefail
+          code="$(curl -sS --max-time 290 -X POST http://127.0.0.1:8080/api/demo -o /tmp/demo.json -w '%{http_code}' || true)"
+          echo "DEMO_HTTP=$code"
+          test "$code" = 201
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/demo.json'))
+          u=d.get('underwriting') or {}
+          print('DEMO_PASS decision=',u.get('decision'),'runs=',u.get('simulation_runs'))
+          assert d.get('underwriting') is not None
+          PY
+      - name: Logs
+        if: always()
+        run: cat /tmp/cogen.log || true
+      - name: Stop
+        if: always()
+        run: test ! -f /tmp/pid || kill "$(cat /tmp/pid)" || true
