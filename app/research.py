@@ -158,6 +158,9 @@ class GeminiGroundedResearchProvider(ResearchProvider):
             attempts_per_model=attempts_per_model,
         )
         self.context_builder = context_builder or WorkingContextBuilder()
+        # Search grounding has a separate quota. Once exhausted, keep Gemini alive without
+        # pretending model-only estimates are verified web evidence.
+        self._grounding_available = True
 
     def research(
         self,
@@ -170,40 +173,78 @@ class GeminiGroundedResearchProvider(ResearchProvider):
         prompt = self._build_prompt(venture, role=role, mandate=mandate)
         from google.genai import types
 
-        if emit:
-            emit("tool_call", name="google_search_grounded_generate", args={"role": role.value if role else None})
-        response = self.router.generate(
-            self.client,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                response_mime_type="application/json",
-            ),
-        )
+        grounding_degraded = not self._grounding_available
+        response = None
+        if self._grounding_available:
+            if emit:
+                emit("tool_call", name="google_search_grounded_generate", args={"role": role.value if role else None})
+            try:
+                response = self.router.generate(
+                    self.client,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        response_mime_type="application/json",
+                    ),
+                )
+            except Exception as exc:
+                message = str(exc).upper()
+                if "RESOURCE_EXHAUSTED" not in message and "429" not in message:
+                    raise
+                self._grounding_available = False
+                grounding_degraded = True
+                if emit:
+                    emit("text", text="Search grounding quota unavailable; continuing with low-confidence Gemini estimates.")
+
+        if response is None:
+            fallback_prompt = prompt.replace(
+                "Search the current web using Google Search grounding.",
+                "Google Search grounding is unavailable for this run.",
+            ) + """
+
+DEGRADED RESEARCH MODE: You cannot browse or verify current web sources in this call.
+Do not invent URLs, laws, licences, fees, suppliers, current prices, or observed market facts.
+You may return rough model estimates for ordinary financial assumptions solely for provisional
+stress testing. Every returned item must use evidence_type=model, confidence=low, source_url=null,
+and source_title="Gemini model estimate — grounding unavailable". Omit regulatory/legal claims
+that require current primary sources rather than guessing them.
+"""
+            if emit:
+                emit("tool_call", name="gemini_model_only_generate", args={"role": role.value if role else None})
+            response = self.router.generate(
+                self.client,
+                contents=fallback_prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+
         payload = json.loads(response.text or "[]")
         if not isinstance(payload, list):
-            raise ValueError("Grounded research response must be a JSON list")
+            raise ValueError("Research response must be a JSON list")
 
-        grounded_urls = self._grounded_urls(response)
+        grounded_urls = set() if grounding_degraded else self._grounded_urls(response)
         if emit:
             emit("tool_result", name="google_search_grounded_generate", result_summary=f"{len(payload)} candidate(s)")
         findings: list[ResearchFinding] = []
         for raw in payload:
             if not isinstance(raw, dict):
                 continue
-            source_url = raw.get("source_url")
-            confidence = self._confidence(raw.get("confidence"), source_url, grounded_urls)
+            source_url = None if grounding_degraded else raw.get("source_url")
+            confidence = Confidence.LOW if grounding_degraded else self._confidence(raw.get("confidence"), source_url, grounded_urls)
+            raw_notes = str(raw.get("notes") or "").strip()
+            notes = raw_notes
+            if grounding_degraded:
+                notes = "Search grounding unavailable; Gemini model-only estimate, not verified evidence." + (f" {raw_notes}" if raw_notes else "")
             findings.append(
                 ResearchFinding(
                     assumption_key=str(raw.get("assumption_key", "")).strip(),
                     claim=str(raw.get("claim", "")).strip(),
                     value=self._float_or_none(raw.get("value")),
                     unit=raw.get("unit"),
-                    evidence_type=self._evidence_type(raw.get("evidence_type")),
+                    evidence_type=EvidenceType.MODEL if grounding_degraded else self._evidence_type(raw.get("evidence_type")),
                     confidence=confidence,
-                    source_title=str(raw.get("source_title") or "Gemini grounded research"),
+                    source_title="Gemini model estimate — grounding unavailable" if grounding_degraded else str(raw.get("source_title") or "Gemini grounded research"),
                     source_url=source_url,
-                    notes=raw.get("notes"),
+                    notes=notes,
                     role=role,
                 )
             )
