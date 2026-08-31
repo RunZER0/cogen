@@ -1254,8 +1254,8 @@ async def create_demo(
     service: VentureService = Depends(service_dep),
 ) -> Venture:
     venture, job = service.create_demo_venture()
-    service.run_analysis_job(job.id)
-    return service.get_venture(venture.id)
+    _schedule_analysis(service, job.id)
+    return venture
 
 
 # ---------------------------------------------------------------------------
