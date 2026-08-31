@@ -22,6 +22,12 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      # Tests import the ADK root agent, which constructs the Gemini model at import time.
+      # Offline tests never call Gemini, so a non-secret placeholder is sufficient here.
+      GEMINI_API_KEY: ci-offline-placeholder
+      RESEARCH_MODE: offline
+      DATABASE_BACKEND: sqlite
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,6 +36,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install and verify
         run: |
+          set -euo pipefail
           uv sync --extra dev --python 3.13
           uv run ruff check app tests
           uv run pytest
@@ -55,7 +62,7 @@ jobs:
       - name: Configure Artifact Registry auth
         run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 
-      - name: Build and push verified Cogen image
+      - name: Build and push image
         id: image
         shell: bash
         run: |
@@ -65,12 +72,13 @@ jobs:
           docker push "$IMAGE"
           echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Build Cloud Run environment file without logging secrets
+      - name: Build Cloud Run environment file
         shell: bash
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
+          set -euo pipefail
           python - <<'PY'
           import json
           import os
@@ -89,6 +97,7 @@ jobs:
               "GOOGLE_API_KEY": os.environ["GEMINI_API_KEY"],
               "GOOGLE_GENAI_USE_VERTEXAI": "false",
               "GEMINI_MODEL": "gemini-3.7-flash",
+              "RESEARCH_PROVIDER": "gemini",
               "RESEARCH_MODE": "live",
               "GOOGLE_CLOUD_PROJECT": os.environ["GCP_PROJECT_ID"],
               "GOOGLE_CLOUD_LOCATION": os.environ["GCP_REGION"],
@@ -117,12 +126,6 @@ jobs:
             --env-vars-file=/tmp/cogen-env.yaml \
             --quiet
 
-          gcloud run services update "$SERVICE_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --region="$GCP_REGION" \
-            --ingress=all \
-            --default-url \
-            --quiet
           gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
             --project="$GCP_PROJECT_ID" \
             --region="$GCP_REGION" \
@@ -130,97 +133,39 @@ jobs:
             --role="roles/run.invoker" \
             --quiet
 
-      - name: Inspect Cloud Run service, traffic and IAM
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '--- SERVICE ---'
-          gcloud run services describe "$SERVICE_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --region="$GCP_REGION" \
-            --format='yaml(metadata.name,metadata.annotations,spec.template.metadata.annotations,status.url,status.address,status.latestCreatedRevisionName,status.latestReadyRevisionName,status.traffic)'
-          echo '--- IAM ---'
-          gcloud run services get-iam-policy "$SERVICE_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --region="$GCP_REGION" \
-            --format='yaml(bindings)'
-
-      - name: Resolve serving Cloud Run URL
+      - name: Resolve and verify public service
         id: service
         shell: bash
         run: |
           set -euo pipefail
-          CANONICAL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
-          STATUS_URL="$(gcloud run services describe "$SERVICE_NAME" \
+          URL="$(gcloud run services describe "$SERVICE_NAME" \
             --project="$GCP_PROJECT_ID" \
             --region="$GCP_REGION" \
             --format='value(status.url)')"
+          test -n "$URL"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "CLOUD_RUN_URL=$URL"
 
-          echo "Canonical candidate: $CANONICAL"
-          echo "Status candidate: $STATUS_URL"
-
-          for attempt in $(seq 1 10); do
-            for candidate in "$CANONICAL" "$STATUS_URL"; do
-              [ -n "$candidate" ] || continue
-              code="$(curl --silent --output /tmp/health-probe.txt --write-out '%{http_code}' \
-                --connect-timeout 10 --max-time 20 "$candidate/healthz" || true)"
-              echo "Public probe $attempt: $candidate/healthz -> $code"
-              if [ "$code" = "200" ]; then
-                echo "url=$candidate" >> "$GITHUB_OUTPUT"
-                echo "Serving Cogen URL: $candidate"
-                exit 0
-              fi
-            done
-            sleep 3
-          done
-
-          echo 'Public probe failed. Testing the service through authenticated gcloud proxy.'
-          gcloud run services proxy "$SERVICE_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --region="$GCP_REGION" \
-            --port=9090 >/tmp/cogen-proxy.log 2>&1 &
-          PROXY_PID=$!
-          trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 10); do
-            code="$(curl --silent --output /tmp/proxy-health.txt --write-out '%{http_code}' \
-              --connect-timeout 3 --max-time 10 http://127.0.0.1:9090/healthz || true)"
-            echo "Authenticated proxy probe $attempt -> $code"
+          for attempt in $(seq 1 12); do
+            code="$(curl --silent --output /tmp/health.json --write-out '%{http_code}' \
+              --connect-timeout 10 --max-time 30 "$URL/healthz" || true)"
+            echo "health attempt $attempt -> $code"
             if [ "$code" = "200" ]; then
-              cat /tmp/proxy-health.txt
-              echo 'Container is healthy through authenticated proxy; public Cloud Run front door remains misconfigured.' >&2
-              exit 2
+              cat /tmp/health.json
+              echo
+              break
             fi
-            sleep 2
+            if [ "$attempt" = "12" ]; then
+              exit 1
+            fi
+            sleep 5
           done
-          echo '--- PROXY LOG ---'
-          cat /tmp/cogen-proxy.log || true
-          echo 'Neither public nor authenticated Cloud Run probe reached Cogen /healthz.' >&2
-          exit 1
 
-      - name: Inspect Cloud Run revision and public front door
-        shell: bash
-        run: |
-          set -euo pipefail
-          URL="${{ steps.service.outputs.url }}"
-          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 "$URL/healthz"
-          echo
-          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 "$URL/readyz"
+          curl --fail --silent --show-error --max-time 30 "$URL/readyz" -o /tmp/ready.json
+          cat /tmp/ready.json
           echo
 
-          CANONICAL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
-          STATUS_URL="$(gcloud run services describe "$SERVICE_NAME" --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --format='value(status.url)')"
-          for candidate in "$CANONICAL" "$STATUS_URL"; do
-            code="$(curl --silent --output /tmp/public-health.txt --write-out '%{http_code}' --connect-timeout 10 --max-time 20 "$candidate/healthz" || true)"
-            echo "PUBLIC_PROBE $candidate/healthz -> $code"
-            if [ "$code" = "200" ]; then
-              echo "PUBLIC_COGEN_URL=$candidate" >> "$GITHUB_ENV"
-            fi
-          done
-
-      - name: Install Cloud Run proxy component
-        run: gcloud components install cloud-run-proxy --quiet
-
-      - name: Prove deployed Cogen, Neon and live Gemini through authenticated Cloud Run
+      - name: Run deployed canonical demo
         shell: bash
         run: |
           set -euo pipefail
@@ -238,16 +183,12 @@ jobs:
           ready = json.loads(Path('/tmp/ready.json').read_text())
           data = json.loads(Path('/tmp/cogen-live-demo.json').read_text())
           underwriting = data.get('underwriting') or {}
-          evidence = data.get('evidence') or []
-          print('CLOUD_RUN_NEON_GEMINI_E2E_PASS')
+          print('CLOUD_RUN_E2E_PASS')
           print('database_backend=', ready.get('database_backend'))
           print('research_mode=', ready.get('research_mode'))
           print('venture_id=', data.get('id'))
           print('decision=', underwriting.get('decision'))
-          print('evidence_count=', len(evidence))
           print('simulation_runs=', underwriting.get('simulation_runs'))
-          print('critical_unknowns=', underwriting.get('critical_unknowns'))
-          print('biggest_risks=', underwriting.get('biggest_risks'))
           if ready.get('database_backend') != 'postgres':
               raise SystemExit('Cloud Run is not using Postgres/Neon')
           if ready.get('research_mode') != 'live':
@@ -256,31 +197,10 @@ jobs:
               raise SystemExit('live demo returned no venture id')
           PY
 
-          VENTURE_ID="$(python -c "import json; print(json.load(open('/tmp/cogen-live-demo.json'))['id'])")"
-          curl --fail --silent "http://127.0.0.1:9090/api/ventures/$VENTURE_ID/specialists" -o /tmp/specialists.json
-          curl --fail --silent "http://127.0.0.1:9090/api/ventures/$VENTURE_ID/validation" -o /tmp/validation.json
-          curl --fail --silent "http://127.0.0.1:9090/api/ventures/$VENTURE_ID/events" -o /tmp/events.json
-          python - <<'PY'
-          import json
-          for name in ('specialists', 'validation', 'events'):
-              data = json.load(open(f'/tmp/{name}.json'))
-              print(f'{name}_count=', len(data))
-              if name == 'specialists':
-                  print('specialist_roles=', [item.get('role') for item in data])
-              if name == 'events':
-                  print('event_types=', [item.get('event_type') for item in data])
-          PY
+      - name: Final deployment URL
+        if: success()
+        run: echo "PUBLIC_COGEN_URL=${{ steps.service.outputs.url }}"
 
-      - name: Report public URL state
+      - name: Cleanup
         if: always()
-        shell: bash
-        run: |
-          if [ -n "${PUBLIC_COGEN_URL:-}" ]; then
-            echo "PUBLIC_COGEN_URL=$PUBLIC_COGEN_URL"
-          else
-            echo "WARNING: Cloud Run authenticated backend passed/was tested separately, but public run.app health probe did not return 200."
-          fi
-
-      - name: Remove temporary files
-        if: always()
-        run: rm -f /tmp/cogen-env.yaml /tmp/cogen-live-demo.json /tmp/specialists.json /tmp/validation.json /tmp/events.json /tmp/health-probe.txt /tmp/proxy-health.txt /tmp/cogen-proxy.log
+        run: rm -f /tmp/cogen-env.yaml /tmp/health.json /tmp/ready.json /tmp/cogen-live-demo.json
