@@ -46,15 +46,18 @@ jobs:
         uses: google-github-actions/setup-gcloud@v3
         with:
           project_id: ${{ env.GCP_PROJECT_ID }}
-      - name: Prepare Vertex access and application
+      - name: Prepare application and inspect Vertex state
         run: |
           set -euo pipefail
-          gcloud services enable aiplatform.googleapis.com --project="$GCP_PROJECT_ID" --quiet
-          gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
-            --member="serviceAccount:$GCP_SERVICE_ACCOUNT" \
-            --role="roles/aiplatform.user" \
-            --condition=None \
-            --quiet
+          echo "--- Vertex API enabled state ---"
+          gcloud services list --enabled --project="$GCP_PROJECT_ID" \
+            --filter='config.name:aiplatform.googleapis.com' \
+            --format='value(config.name)' || true
+          echo "--- Relevant IAM bindings (best effort) ---"
+          gcloud projects get-iam-policy "$GCP_PROJECT_ID" \
+            --flatten='bindings[].members' \
+            --filter="bindings.members:$GCP_SERVICE_ACCOUNT OR bindings.members:cogen-runtime@cogen-506607.iam.gserviceaccount.com" \
+            --format='table(bindings.role,bindings.members)' || true
           uv sync --extra dev --python 3.13
           uv run playwright install --with-deps chromium
           uv run ruff check app tests
