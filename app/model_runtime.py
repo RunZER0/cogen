@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +32,12 @@ class GeminiModelRouter:
     fallback. It records health counters so readiness/observability can expose degradation instead of
     silently hiding it. The router never changes business state or treats a fallback response differently
     from primary evidence; the same evidence policy still applies afterwards.
+
+    For the production release, Google Search grounding can be disabled independently from Gemini itself.
+    When it is disabled, tool-bearing requests fail fast with the same degradable signal the research
+    provider already understands, so the provider immediately continues with a real model-only Gemini
+    call and labels those estimates as low-confidence/non-grounded evidence. This prevents an upstream
+    Search-tool transport hang from consuming the entire Cloud Run request timeout.
     """
 
     def __init__(
@@ -45,7 +52,25 @@ class GeminiModelRouter:
         self.attempts_per_model = max(1, attempts_per_model)
         self.health = ModelHealth(primary=primary, fallback=self.fallback)
 
+    @staticmethod
+    def _grounding_disabled(config: Any) -> bool:
+        if os.getenv("APP_ENV", "").strip().lower() != "production":
+            return False
+        enabled = os.getenv("GEMINI_SEARCH_GROUNDING", "true").strip().lower()
+        if enabled not in {"0", "false", "no", "off"}:
+            return False
+        return bool(getattr(config, "tools", None))
+
     def generate(self, client: Any, *, contents: str, config: Any) -> Any:
+        # The surrounding research provider already has a safety-preserving degraded path for
+        # unavailable Search grounding. Surface that path immediately instead of making a request
+        # known to hang in the current production environment. Model-only calls have no tools and
+        # continue through the real Gemini API below.
+        if self._grounding_disabled(config):
+            raise RuntimeError(
+                "429 RESOURCE_EXHAUSTED: Google Search grounding disabled for bounded production release"
+            )
+
         models = [self.primary] + ([self.fallback] if self.fallback else [])
         last_error: Exception | None = None
         self.health.total_calls += 1
