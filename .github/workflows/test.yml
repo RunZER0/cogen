@@ -7,6 +7,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # CI imports the ADK root agent but never makes a live Gemini call.
+      GEMINI_API_KEY: ci-offline-placeholder
+      RESEARCH_MODE: offline
+      DATABASE_BACKEND: sqlite
     strategy:
       fail-fast: false
       matrix:
