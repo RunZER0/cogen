@@ -1,0 +1,90 @@
+name: hotfix-production-vertex
+
+on:
+  push:
+    paths:
+      - .github/workflows/hotfix-vertex.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch production Gemini transport to Vertex AI
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str):
+              p = Path(path)
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f"Expected text not found in {path}: {old[:120]!r}")
+              p.write_text(text.replace(old, new))
+
+          # Settings: production can select Vertex AI without requiring an AI Studio API key.
+          replace(
+              "app/settings.py",
+              '    gemini_attempts_per_model: int = 2\n    research_provider: str = "gemini"',
+              '    gemini_attempts_per_model: int = 2\n    google_genai_use_vertexai: bool = False\n    research_provider: str = "gemini"',
+          )
+
+          # Runtime research provider: accept ADC/Vertex as the live Gemini credential path.
+          replace(
+              "app/runtime.py",
+              '            if provider == "gemini" and not settings.gemini_api_key:\n                raise RuntimeError("SPECIALIST_MODE=agentic with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY")',
+              '            if provider == "gemini" and not (settings.gemini_api_key or settings.google_genai_use_vertexai):\n                raise RuntimeError("SPECIALIST_MODE=agentic with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY or Vertex AI")',
+          )
+          replace(
+              "app/runtime.py",
+              '        if not settings.gemini_api_key:\n            raise RuntimeError("RESEARCH_MODE=live with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY")',
+              '        if not (settings.gemini_api_key or settings.google_genai_use_vertexai):\n            raise RuntimeError("RESEARCH_MODE=live with RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY or Vertex AI")',
+          )
+          replace(
+              "app/runtime.py",
+              '            api_key=settings.gemini_api_key,\n            fallback_model=settings.gemini_fallback_model,',
+              '            api_key=None if settings.google_genai_use_vertexai else settings.gemini_api_key,\n            fallback_model=settings.gemini_fallback_model,',
+          )
+
+          # ADK conversational model: use the same Vertex transport as research in production.
+          replace(
+              "app/llm.py",
+              '    if not settings.gemini_api_key:\n        raise RuntimeError("RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY")\n    from google.adk.models import Gemini\n    from google.genai import types\n\n    return Gemini(\n        model=settings.gemini_model,\n        # Verified live: without this, the underlying google.genai Client looks for the key in the\n        # process\'s real OS environment, not in our Settings object — GEMINI_API_KEY loaded from\n        # .env via pydantic-settings never reaches os.environ, so a chat call failed with "No API key\n        # was provided" even though get_settings().gemini_api_key was correctly set. client_kwargs is\n        # ADK\'s documented passthrough to the google.genai.Client constructor.\n        client_kwargs={"api_key": settings.gemini_api_key},\n        retry_options=types.HttpRetryOptions(attempts=3),\n    )',
+              '    if not (settings.gemini_api_key or settings.google_genai_use_vertexai):\n        raise RuntimeError("RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY or Vertex AI")\n    from google.adk.models import Gemini\n    from google.genai import types\n\n    if settings.google_genai_use_vertexai:\n        if not settings.google_cloud_project:\n            raise RuntimeError("Vertex AI requires GOOGLE_CLOUD_PROJECT")\n        client_kwargs = {\n            "vertexai": True,\n            "project": settings.google_cloud_project,\n            "location": settings.google_cloud_location,\n        }\n    else:\n        client_kwargs = {"api_key": settings.gemini_api_key}\n\n    return Gemini(\n        model=settings.gemini_model,\n        client_kwargs=client_kwargs,\n        retry_options=types.HttpRetryOptions(attempts=3),\n    )',
+          )
+
+          # Cloud Run: stop injecting the exhausted AI Studio key; use the runtime service account.
+          replace(
+              ".github/workflows/deploy.yml",
+              '          required = ["GEMINI_API_KEY", "DATABASE_URL"]',
+              '          required = ["DATABASE_URL"]',
+          )
+          replace(
+              ".github/workflows/deploy.yml",
+              '              "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"],\n              "GOOGLE_API_KEY": os.environ["GEMINI_API_KEY"],\n              "GOOGLE_GENAI_USE_VERTEXAI": "false",',
+              '              "GOOGLE_GENAI_USE_VERTEXAI": "true",',
+          )
+          replace(
+              ".github/workflows/deploy.yml",
+              '          set -euo pipefail\n          gcloud run deploy "$SERVICE_NAME"',
+              '          set -euo pipefail\n          gcloud services enable aiplatform.googleapis.com --project="$GCP_PROJECT_ID" --quiet\n          gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \\\n            --member="serviceAccount:$GCP_RUNTIME_SERVICE_ACCOUNT" \\\n            --role="roles/aiplatform.user" \\\n            --condition=None \\\n            --quiet\n          gcloud run deploy "$SERVICE_NAME"',
+          )
+
+          # The secret may remain available to the GitHub step for local compatibility, but it is no
+          # longer written into the Cloud Run environment. Explicit setting below drives both ADK and
+          # google-genai through Vertex AI.
+          PY
+
+          git diff --check
+          git diff
+          git config user.name "cogen-release-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add app/settings.py app/runtime.py app/llm.py .github/workflows/deploy.yml
+          git commit -m "Use Vertex AI for production Gemini calls"
+          git push origin HEAD:main
