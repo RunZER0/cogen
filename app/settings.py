@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.7-flash"
     gemini_fallback_model: str | None = "gemini-3.6-flash"
     gemini_attempts_per_model: int = 2
+    google_genai_use_vertexai: bool = False
     research_provider: str = "gemini"
     openrouter_api_key: str | None = None
     openrouter_model: str = "google/gemini-3.5-flash-lite"
