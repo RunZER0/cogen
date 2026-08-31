@@ -112,7 +112,7 @@ jobs:
             --region="$GCP_REGION" \
             --image="${{ steps.image.outputs.uri }}" \
             --service-account="$GCP_RUNTIME_SERVICE_ACCOUNT" \
-            --allow-unauthenticated \
+            --no-invoker-iam-check \
             --ingress=all \
             --default-url \
             --min-instances=0 \
@@ -124,39 +124,57 @@ jobs:
             --env-vars-file=/tmp/cogen-env.yaml \
             --quiet
 
+          # Keep the legacy public binding too. The disabled invoker check is the current
+          # Google-recommended public-access mechanism and also works under domain restrictions.
           gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
             --project="$GCP_PROJECT_ID" \
             --region="$GCP_REGION" \
             --member="allUsers" \
             --role="roles/run.invoker" \
-            --quiet
+            --quiet || true
+
+          echo "--- Cloud Run endpoint/security state ---"
+          gcloud run services describe "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --format='yaml(metadata.annotations,status.url,status.address)'
 
       - name: Resolve and verify public service
         id: service
         shell: bash
         run: |
           set -euo pipefail
-          # Cloud Run exposes a canonical deterministic URL. status.url can still return the
-          # legacy *.a.run.app hostname, which is not routable for this service and gave 404s.
-          URL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "CLOUD_RUN_URL=$URL"
+          CANONICAL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
+          LEGACY="$(gcloud run services describe "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --format='value(status.url)')"
 
-          for attempt in $(seq 1 12); do
-            code="$(curl --silent --output /tmp/health.json --write-out '%{http_code}' \
-              --connect-timeout 10 --max-time 30 "$URL/healthz" || true)"
-            echo "health attempt $attempt -> $code"
-            if [ "$code" = "200" ]; then
-              cat /tmp/health.json
-              echo
-              break
-            fi
-            if [ "$attempt" = "12" ]; then
-              exit 1
-            fi
-            sleep 5
+          URL=""
+          for candidate in "$CANONICAL" "$LEGACY"; do
+            [ -n "$candidate" ] || continue
+            echo "Probing $candidate"
+            for attempt in $(seq 1 6); do
+              code="$(curl --silent --output /tmp/health.json --write-out '%{http_code}' \
+                --connect-timeout 10 --max-time 30 "$candidate/healthz" || true)"
+              echo "health attempt $attempt -> $code"
+              if [ "$code" = "200" ]; then
+                URL="$candidate"
+                cat /tmp/health.json
+                echo
+                break 2
+              fi
+              sleep 3
+            done
           done
 
+          if [ -z "$URL" ]; then
+            echo "Neither Cloud Run hostname is publicly serving /healthz."
+            exit 1
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "CLOUD_RUN_URL=$URL"
           curl --fail --silent --show-error --max-time 30 "$URL/readyz" -o /tmp/ready.json
           cat /tmp/ready.json
           echo
