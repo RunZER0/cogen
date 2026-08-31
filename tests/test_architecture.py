@@ -118,8 +118,8 @@ def test_conflicting_numeric_evidence_is_recorded(service, intake_payload):
 
 
 class FabricatingProvider(ResearchProvider):
-    def research(self, venture, *, role=None, mandate=None):
-        del venture, mandate
+    def research(self, venture, *, role=None, mandate=None, emit=None):
+        del venture, mandate, emit
         if role != SpecialistRole.REGULATORY:
             return []
         return [

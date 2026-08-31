@@ -20,6 +20,9 @@ class VentureRepository(ABC):
     def list_ventures(self) -> list[Venture]: ...
 
     @abstractmethod
+    def delete_venture(self, venture_id: str) -> None: ...
+
+    @abstractmethod
     def save_job(self, job: AnalysisJob) -> AnalysisJob: ...
 
     @abstractmethod
@@ -49,6 +52,11 @@ class VentureRepository(ABC):
 
     @abstractmethod
     def list_state_records(self, kind: str, venture_id: str) -> list[str]: ...
+
+    @abstractmethod
+    def list_all_state_records(self, kind: str) -> list[str]:
+        """Return all state records of a given kind across all ventures."""
+        ...
 
     def ping(self) -> bool:
         return True
@@ -144,6 +152,11 @@ class SQLiteRepository(VentureRepository):
             rows = con.execute("SELECT payload FROM ventures ORDER BY updated_at DESC").fetchall()
         return [Venture.model_validate_json(row["payload"]) for row in rows]
 
+    def delete_venture(self, venture_id: str) -> None:
+        with self._lock, self._connection() as con:
+            con.execute("DELETE FROM ventures WHERE id=?", (venture_id,))
+            con.execute("DELETE FROM state_records WHERE venture_id=?", (venture_id,))
+
     def save_job(self, job: AnalysisJob) -> AnalysisJob:
         payload = job.model_dump_json()
         with self._lock, self._connection() as con:
@@ -226,16 +239,36 @@ class SQLiteRepository(VentureRepository):
             ).fetchall()
         return [row["payload"] for row in rows]
 
+    def list_all_state_records(self, kind: str) -> list[str]:
+        with self._connection() as con:
+            rows = con.execute(
+                """
+                SELECT payload FROM state_records
+                WHERE kind=?
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (kind,),
+            ).fetchall()
+        return [row["payload"] for row in rows]
+
     def ping(self) -> bool:
         with self._connection() as con:
             return con.execute("SELECT 1").fetchone()[0] == 1
 
 
 class PostgresRepository(VentureRepository):
-    """Neon/Postgres persistence.
+    """Neon/Postgres persistence, via a small client-side connection pool.
 
-    Connections are intentionally short-lived. Neon pooled connection strings provide the pooling layer,
-    which avoids a separate application pool per Cloud Run instance and keeps scale-to-zero predictable.
+    The original design opened a fresh psycopg connection per query, on the assumption that
+    Neon's own pooled connection string (the `-pooler` endpoint) made a "new" connection cheap
+    since the server side already keeps warm backend connections ready. Measured live, repeatedly,
+    that assumption doesn't hold: every psycopg.connect() call still pays a full client-side
+    TCP+TLS handshake to Neon's servers regardless of pooling on the far end, and that cost alone
+    was making a single intake question round-trip take ~5 seconds. A small pool of
+    already-authenticated connections, held open for the life of this process, removes that cost
+    for the common case. Kept deliberately small — not one per potential concurrent request — so a
+    Cloud Run instance isn't holding open a large number of idle connections against Neon's own
+    connection limit; Neon's pooler still absorbs bursts beyond this pool's size.
     """
 
     def __init__(self, database_url: str):
@@ -243,15 +276,23 @@ class PostgresRepository(VentureRepository):
             raise ValueError("DATABASE_URL is required for DATABASE_BACKEND=postgres")
         self.database_url = database_url
         self._lock = RLock()
+        try:
+            from psycopg_pool import ConnectionPool
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency installed in CI/runtime
+            raise RuntimeError("Postgres backend requires psycopg_pool") from exc
+        # Neon closes idle connections server-side well inside the pool's own default max_idle —
+        # reproduced live: a pooled connection handed back out failed with "server closed the
+        # connection unexpectedly" on the very next query. check=check_connection makes the pool
+        # verify a connection is actually alive before handing it out, transparently discarding and
+        # replacing a stale one instead of returning it to the caller to fail on.
+        self._pool = ConnectionPool(
+            database_url, min_size=1, max_size=5, open=True, check=ConnectionPool.check_connection,
+        )
         self._init_db()
 
     @contextmanager
     def _connection(self):
-        try:
-            import psycopg
-        except ModuleNotFoundError as exc:  # pragma: no cover - dependency installed in CI/runtime
-            raise RuntimeError("Postgres backend requires psycopg") from exc
-        with psycopg.connect(self.database_url) as con:
+        with self._pool.connection() as con:
             yield con
 
     def _init_db(self) -> None:
@@ -324,6 +365,11 @@ class PostgresRepository(VentureRepository):
             cur.execute("SELECT payload::text FROM ventures ORDER BY updated_at DESC")
             rows = cur.fetchall()
         return [Venture.model_validate_json(row[0]) for row in rows]
+
+    def delete_venture(self, venture_id: str) -> None:
+        with self._lock, self._connection() as con, con.cursor() as cur:
+            cur.execute("DELETE FROM ventures WHERE id=%s", (venture_id,))
+            cur.execute("DELETE FROM state_records WHERE venture_id=%s", (venture_id,))
 
     def save_job(self, job: AnalysisJob) -> AnalysisJob:
         payload = job.model_dump_json()
@@ -400,6 +446,19 @@ class PostgresRepository(VentureRepository):
                 ORDER BY updated_at ASC, id ASC
                 """,
                 (kind, venture_id),
+            )
+            rows = cur.fetchall()
+        return [row[0] for row in rows]
+
+    def list_all_state_records(self, kind: str) -> list[str]:
+        with self._connection() as con, con.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload::text FROM state_records
+                WHERE kind=%s
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (kind,),
             )
             rows = cur.fetchall()
         return [row[0] for row in rows]

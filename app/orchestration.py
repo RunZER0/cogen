@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from app.domain import (
     AssumptionCategory,
@@ -10,7 +10,7 @@ from app.domain import (
     Venture,
 )
 from app.evidence import EvidenceLedger
-from app.research import ResearchFinding, ResearchProvider
+from app.research import EmitFn, ResearchFinding, ResearchProvider
 
 
 MANDATES: dict[SpecialistRole, str] = {
@@ -112,17 +112,26 @@ class SpecialistOrchestrator:
         role: SpecialistRole,
         *,
         seen: set[tuple] | None = None,
+        confirmed_context: str | None = None,
+        emit: EmitFn | None = None,
     ) -> OrchestrationResult:
         seen = seen if seen is not None else set()
         accepted: list[ResearchFinding] = []
         contradictions = []
         rejected: list[str] = []
         rounds_used = 0
-        mandate = MANDATES[role]
+        base_mandate = MANDATES[role]
+
+        # If there are confirmed findings from prior specialists, prepend them to the first mandate
+        # so the model focuses on gaps rather than re-searching already-resolved facts.
+        if confirmed_context:
+            mandate = f"{confirmed_context}\n\n{base_mandate}"
+        else:
+            mandate = base_mandate
 
         for round_number in range(1, self.max_rounds + 1):
             rounds_used = round_number
-            raw = self.provider.research(venture, role=role, mandate=mandate)
+            raw = self.provider.research(venture, role=role, mandate=mandate, emit=emit)
             prepared = self.ledger.prepare(venture, raw, role=role)
             newly_accepted: list[ResearchFinding] = []
             for item in prepared.accepted:
@@ -141,18 +150,35 @@ class SpecialistOrchestrator:
             contradictions.extend(prepared.contradictions)
             rejected.extend(prepared.rejected)
 
+            # Checkpointed per round, not only once at the very end of the role: if round 2 dies,
+            # round 1's already-accepted findings are still safely on file (see workflow.py's
+            # SubagentRegistry.run_inline wiring, which persists these into the ResearchBatch as
+            # they arrive) instead of vanishing along with the rest of an in-progress role.
+            if emit:
+                emit(
+                    "round_checkpoint",
+                    round=round_number,
+                    findings=[asdict(item) for item in newly_accepted],
+                    rejected=list(prepared.rejected),
+                )
+
             if round_number >= self.max_rounds:
                 break
             focus = self._focus_keys(venture, role, accepted)
             if not focus:
                 break
             prior_sources = sorted({item.source_url for item in accepted if item.source_url})
-            mandate = (
+            follow_up_mandate = (
                 f"Follow-up round. Resolve or falsify these still-material assumptions: {focus}. "
                 "Seek stronger or independent evidence, not paraphrases of the first pass. "
                 f"Already used source URLs: {prior_sources[:6]}. "
                 "Stop rather than manufacture certainty if reliable evidence is unavailable."
             )
+            # Keep confirmed-context anchor in subsequent rounds too
+            if confirmed_context:
+                mandate = f"{confirmed_context}\n\n{follow_up_mandate}"
+            else:
+                mandate = follow_up_mandate
 
         report = SpecialistReport(
             venture_id=venture.id,

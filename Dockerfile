@@ -13,6 +13,11 @@ COPY app ./app
 COPY web ./web
 RUN pip install --no-cache-dir "."
 
+# The browse_page_for_details agent tool needs a real Chromium — install it and its OS-level deps
+# (fonts, codecs, etc.) while still root, into a path the later non-root user can read.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium
+
 # Fail the image build if Python resolves some dependency's top-level `app`
 # instead of Cogen, or if our health route is absent.
 RUN python - <<'PY'
@@ -28,7 +33,7 @@ assert "/healthz" in routes, routes
 assert "/readyz" in routes, routes
 PY
 
-RUN useradd -r -u 10001 appuser && chown -R appuser:appuser /app
+RUN useradd -r -u 10001 appuser && chown -R appuser:appuser /app /ms-playwright
 USER appuser
 
 EXPOSE 8080

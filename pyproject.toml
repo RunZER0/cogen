@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "venture-twin-agent"
 version = "0.2.0"
-description = "Persistent adversarial venture underwriting and execution agent for the Google All Things Agentic Hackathon."
+description = "Persistent venture underwriting and execution partner for the Google All Things Agentic Hackathon."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,7 +16,12 @@ dependencies = [
   "google-adk[gcp]>=2.0.0,<3",
   "google-genai>=2.0.0,<3",
   "httpx>=0.28.0,<1",
-  "psycopg[binary]>=3.2.0,<4",
+  "openai>=1.100.0,<3",
+  "psycopg[binary,pool]>=3.2.0,<4",
+  "playwright>=1.55.0,<2",
+  "sqlalchemy>=2.0.0,<3",
+  "aiosqlite>=0.20.0,<1",
+  "asyncpg>=0.29.0,<1",
 ]
 
 [project.optional-dependencies]

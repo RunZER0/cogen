@@ -109,3 +109,35 @@ def test_progressive_intake_requires_jurisdiction_and_currency(service):
     )
     assert "country" in draft.missing_material_fields
     assert "currency" in draft.missing_material_fields
+
+
+def test_offline_fixture_is_withheld_outside_its_native_currency(service):
+    """A KES-scale fixture must not be relabelled as another currency.
+
+    Presenting a KES rent magnitude as "USD 55,000/month" would be a fabricated cross-market claim.
+    Outside its native currency the provider returns nothing and the venture stays at needs_data.
+    """
+    from app.research import OfflineResearchProvider
+
+    intake = VentureIntake.model_validate(
+        _payload(
+            location="Austin, Texas, United States", locality="Austin", subdivision="Texas",
+            country="United States", currency="USD", locale="en-US",
+        )
+    )
+    venture = service.create_venture(intake)
+    assert OfflineResearchProvider().research(venture, role=SpecialistRole.FINANCE) == []
+
+    service.run_analysis_job(service.create_analysis_job(venture.id).id)
+    settled = service.get_venture(venture.id)
+    assert settled.underwriting.decision.value == "needs_data"
+    assert not [e for e in settled.evidence if e.evidence_type.value == "demo"]
+
+
+def test_offline_fixture_still_serves_its_native_currency(service, intake_payload):
+    from app.research import OfflineResearchProvider
+
+    venture = service.create_venture(VentureIntake.model_validate(intake_payload))
+    findings = OfflineResearchProvider().research(venture, role=SpecialistRole.FINANCE)
+    assert findings
+    assert all(f.unit is None or "KES" in f.unit or f.unit == "ratio" for f in findings)

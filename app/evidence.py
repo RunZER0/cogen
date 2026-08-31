@@ -12,7 +12,7 @@ from app.domain import (
     Venture,
 )
 from app.research import ResearchFinding
-from app.source_router import policy_for, source_strength
+from app.source_router import is_likely_official_authority_url, policy_for, source_strength
 
 
 DEPENDENCIES: dict[str, set[str]] = {
@@ -58,9 +58,12 @@ class EvidenceLedger:
                 rejected.append("missing assumption_key or claim")
                 continue
             if policy and policy.official_required:
-                if finding.evidence_type != EvidenceType.OFFICIAL or not finding.source_url:
+                if (
+                    finding.evidence_type != EvidenceType.OFFICIAL
+                    or not is_likely_official_authority_url(finding.source_url)
+                ):
                     rejected.append(
-                        f"{finding.assumption_key}: regulatory claim lacks an official source"
+                        f"{finding.assumption_key}: regulatory claim lacks a recognizable official authority URL"
                     )
                     continue
             if (
@@ -113,6 +116,7 @@ class EvidenceLedger:
                     venture_id=venture.id,
                     assumption_key=candidate.assumption_key,
                     evidence_id_a=existing.id,
+                    evidence_id_b=candidate.id,
                     description=(
                         f"Conflicting values for {candidate.assumption_key}: "
                         f"{existing.value} from {existing.source_title} versus "

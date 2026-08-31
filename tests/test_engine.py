@@ -44,6 +44,23 @@ def test_decision_is_not_approve_while_critical_unknowns_exist(service, intake_p
     assert venture.underwriting.decision != Decision.APPROVE
 
 
+def test_needs_data_critical_unknowns_have_no_duplicate_gaps(service, intake_payload):
+    """A key that is both a weak critical assumption and a required financial key must be named
+    once, not twice under two different label formats (e.g. "Monthly premises rent" from the
+    assumption label and "Monthly Rent" from the prettified key) — found live when a fresh
+    venture's critical_unknowns listed the same missing rent figure under both spellings."""
+    venture = service.create_venture(VentureIntake.model_validate(intake_payload))
+    assert venture.underwriting is None
+    venture = service.engine.underwrite(venture)
+    unknowns = venture.underwriting.critical_unknowns
+    assert unknowns
+    normalized = [item.lower().replace(" ", "") for item in unknowns]
+    assert len(normalized) == len(set(normalized)), f"duplicate critical_unknowns entries: {unknowns}"
+    # Specifically the pair observed live: the assumption label and the pretty-printed key for rent.
+    assert not ("Monthly premises rent" in unknowns and "Monthly Rent" in unknowns)
+    assert not ("Total setup and opening inventory cost" in unknowns and "Setup Costs" in unknowns)
+
+
 def test_simulation_is_bounded_and_reproducible(service, intake_payload):
     venture = create_and_analyze(service, intake_payload)
     first = venture.underwriting.break_even_probability_12m
@@ -137,3 +154,81 @@ def test_unknown_assumption_evidence_is_rejected(service, intake_payload):
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+def test_direct_model_evidence_cannot_claim_high_confidence(service, intake_payload):
+    venture = service.create_venture(VentureIntake.model_validate(intake_payload))
+    updated = service.add_evidence(
+        venture.id,
+        AddEvidenceRequest(
+            assumption_key="monthly_rent",
+            claim="A model estimated the rent",
+            value=100_000,
+            unit="KES/month",
+            evidence_type=EvidenceType.MODEL,
+            confidence=Confidence.VERIFIED,
+            source_title="Model estimate",
+            source_url="https://example.invalid/not-evidence",
+        ),
+    )
+    evidence = updated.evidence[-1]
+    assert evidence.confidence == Confidence.LOW
+    assert updated.assumption_map()["monthly_rent"].confidence == Confidence.LOW
+
+
+def test_direct_official_evidence_requires_authority_url(service, intake_payload):
+    venture = service.create_venture(VentureIntake.model_validate(intake_payload))
+    request = AddEvidenceRequest(
+        assumption_key="regulatory_registration_path",
+        claim="A permit costs 6,000 KES",
+        value=6_000,
+        unit="KES",
+        evidence_type=EvidenceType.OFFICIAL,
+        confidence=Confidence.VERIFIED,
+        source_title="A random page",
+        source_url="https://example.invalid/permit",
+    )
+    try:
+        service.add_evidence(venture.id, request)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "official" in str(exc).lower()
+
+
+def test_identify_rescue_candidate_when_assumptions_verified(service, intake_payload):
+    from app.domain import Confidence, EvidenceType
+    from app.simulation import identify_rescue_candidate
+    venture = service.create_venture(VentureIntake.model_validate(intake_payload))
+    # Make all financial assumptions verified with a thin margin that yields negative monthly profit
+    overrides = {
+        "gross_margin_pct": (0.05, "5% gross margin"),
+        "monthly_rent": (50000.0, "50k rent"),
+        "monthly_payroll": (80000.0, "80k payroll"),
+        "monthly_utilities": (10000.0, "10k utilities"),
+        "average_basket": (1000.0, "1k basket"),
+        "transactions_per_day": (10.0, "10 tx/day"),
+        "days_open_month": (26.0, "26 days"),
+        "shrinkage_pct": (0.01, "1% shrinkage"),
+        "setup_costs": (100000.0, "100k setup"),
+    }
+    for key, (val, claim) in overrides.items():
+        venture = service.add_evidence(
+            venture.id,
+            AddEvidenceRequest(
+                assumption_key=key,
+                claim=claim,
+                value=val,
+                evidence_type=EvidenceType.OBSERVED,
+                confidence=Confidence.VERIFIED,
+                source_title="Test verification",
+            ),
+        )
+    # Baseline monthly operating profit is negative
+    assert venture.underwriting.monthly_operating_profit_base < 0
+    # identify_rescue_candidate should still find the structural sensitivity lever (e.g. gross margin expansion)
+    rescue = identify_rescue_candidate(venture)
+    assert rescue is not None
+    assert "assumption_key" in rescue
+    assert rescue["gain"] > 0
+    assert rescue["assumption_key"] == "gross_margin_pct"
+

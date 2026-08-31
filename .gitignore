@@ -12,3 +12,5 @@ htmlcov/
 .vscode/
 gha-creds-*.json
 *.db-journal
+*.egg-info/
+node_modules/

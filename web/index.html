@@ -3,111 +3,30 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Venture Twin</title>
+  <title>Cogen — Venture Twin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,500;1,400&display=swap">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+
   <header class="topbar">
-    <div>
-      <span class="eyebrow">VENTURE TWIN</span>
-      <h1>Do the homework before the money goes out.</h1>
+    <div class="topbar-in">
+      <a class="brand" href="#/">
+        <span class="brand-mark">COGEN</span>
+        <span class="brand-name">Venture Twin</span>
+      </a>
+      <nav class="topnav" id="crumbs"></nav>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="theme" aria-label="Switch colour theme" title="Switch colour theme">◐</button>
     </div>
-    <button id="demoButton" class="button secondary">Load Ruiru demo</button>
   </header>
 
-  <main>
-    <section class="hero-grid">
-      <div class="panel intake-panel">
-        <div class="section-label">New venture</div>
-        <form id="ventureForm">
-          <label>What do you want to start?
-            <textarea name="idea" required>Open a neighbourhood supermarket/minimart</textarea>
-          </label>
-          <div class="grid two">
-            <label>Business type<input name="business_type" value="supermarket retail" required></label>
-            <label>Location<input name="location" value="Ruiru, Kiambu County, Kenya" required></label>
-          </div>
-          <div class="grid three">
-            <label>Available capital<input name="capital" type="number" min="1" value="1800000" required></label>
-            <label>Protected reserve<input name="reserve" type="number" min="0" value="150000"></label>
-            <label>Monthly income target<input name="income" type="number" min="0" value="120000"></label>
-          </div>
-          <div class="grid three">
-            <label>Max acceptable loss<input name="max_loss" type="number" min="0" value="600000"></label>
-            <label>Launch target (months)<input name="launch_months" type="number" min="1" max="60" value="4"></label>
-            <label>Time commitment<select name="time_commitment"><option>full-time</option><option>part-time</option><option>absentee owner</option></select></label>
-          </div>
-          <label>Relevant experience<input name="experience" value="first-time retail founder"></label>
-          <div class="actions">
-            <button class="button" type="submit">Create venture</button>
-            <button id="analyzeButton" class="button danger" type="button" disabled>Attack the idea</button>
-          </div>
-        </form>
-      </div>
+  <main id="view" class="view"></main>
 
-      <aside class="panel philosophy">
-        <div class="section-label">Operating rule</div>
-        <p class="big-copy">The agent is rewarded for finding a reason <em>not</em> to let you commit capital.</p>
-        <ul>
-          <li>Every important belief becomes an assumption.</li>
-          <li>Every assumption carries evidence and confidence.</li>
-          <li>Weak facts lock irreversible execution gates.</li>
-          <li>When reality changes, the model changes with it.</li>
-        </ul>
-      </aside>
-    </section>
+  <div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
 
-    <section id="dashboard" class="dashboard hidden">
-      <div class="dashboard-head">
-        <div>
-          <span class="eyebrow">LIVE VENTURE</span>
-          <h2 id="ventureTitle"></h2>
-          <p id="ventureMeta" class="muted"></p>
-        </div>
-        <div id="decisionBadge" class="decision-badge">UNASSESSED</div>
-      </div>
-
-      <div class="metric-grid">
-        <article class="metric"><span>Evidence coverage</span><strong id="coverage">—</strong><div class="bar"><i id="coverageBar"></i></div></article>
-        <article class="metric"><span>Modelled 12m break-even</span><strong id="probability">—</strong><small>Conditional on current assumptions</small></article>
-        <article class="metric"><span>Capital after setup</span><strong id="capitalRemaining">—</strong></article>
-        <article class="metric"><span>Critical unknowns</span><strong id="unknownCount">—</strong></article>
-      </div>
-
-      <div class="grid dashboard-columns">
-        <section class="panel">
-          <div class="section-label">Assumption ledger</div>
-          <div id="assumptions" class="stack"></div>
-        </section>
-        <section class="panel">
-          <div class="section-label">What can kill this</div>
-          <div id="risks" class="stack"></div>
-          <div class="divider"></div>
-          <div class="section-label">Decision reasoning</div>
-          <div id="rationale" class="stack"></div>
-        </section>
-      </div>
-
-      <section class="panel roadmap-panel">
-        <div class="section-label">Execution gates</div>
-        <p class="muted">Irreversible steps stay locked while material assumptions are weak.</p>
-        <div id="roadmap" class="roadmap"></div>
-      </section>
-
-      <section class="panel change-panel">
-        <div class="section-label">Reality changed?</div>
-        <div class="grid three">
-          <label>Assumption<select id="changeAssumption"></select></label>
-          <label>New numeric value<input id="changeValue" type="number" step="any"></label>
-          <label>Confidence<select id="changeConfidence"><option>low</option><option selected>medium</option><option>high</option><option>verified</option></select></label>
-        </div>
-        <label>What changed?<input id="changeSummary" placeholder="A competitor opened 350m away / rent quote changed / supplier quote arrived"></label>
-        <button id="applyChangeButton" class="button secondary">Re-run from this change</button>
-      </section>
-    </section>
-  </main>
-
-  <div id="toast" class="toast hidden"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>
