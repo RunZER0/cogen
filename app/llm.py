@@ -105,18 +105,24 @@ def build_agent_model(settings: Settings):
             max_tokens=12000,
             client=client,
         )
-    if not settings.gemini_api_key:
-        raise RuntimeError("RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY")
+    if not (settings.gemini_api_key or settings.google_genai_use_vertexai):
+        raise RuntimeError("RESEARCH_PROVIDER=gemini requires GEMINI_API_KEY or Vertex AI")
     from google.adk.models import Gemini
     from google.genai import types
 
+    if settings.google_genai_use_vertexai:
+        if not settings.google_cloud_project:
+            raise RuntimeError("Vertex AI requires GOOGLE_CLOUD_PROJECT")
+        client_kwargs = {
+            "vertexai": True,
+            "project": settings.google_cloud_project,
+            "location": settings.google_cloud_location,
+        }
+    else:
+        client_kwargs = {"api_key": settings.gemini_api_key}
+
     return Gemini(
         model=settings.gemini_model,
-        # Verified live: without this, the underlying google.genai Client looks for the key in the
-        # process's real OS environment, not in our Settings object — GEMINI_API_KEY loaded from
-        # .env via pydantic-settings never reaches os.environ, so a chat call failed with "No API key
-        # was provided" even though get_settings().gemini_api_key was correctly set. client_kwargs is
-        # ADK's documented passthrough to the google.genai.Client constructor.
-        client_kwargs={"api_key": settings.gemini_api_key},
+        client_kwargs=client_kwargs,
         retry_options=types.HttpRetryOptions(attempts=3),
     )
