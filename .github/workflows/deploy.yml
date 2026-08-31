@@ -23,8 +23,6 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     env:
-      # Tests import the ADK root agent, which constructs the Gemini model at import time.
-      # Offline tests never call Gemini, so a non-secret placeholder is sufficient here.
       GEMINI_API_KEY: ci-offline-placeholder
       RESEARCH_MODE: offline
       DATABASE_BACKEND: sqlite
@@ -138,11 +136,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          URL="$(gcloud run services describe "$SERVICE_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --region="$GCP_REGION" \
-            --format='value(status.url)')"
-          test -n "$URL"
+          # Cloud Run exposes a canonical deterministic URL. status.url can still return the
+          # legacy *.a.run.app hostname, which is not routable for this service and gave 404s.
+          URL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "CLOUD_RUN_URL=$URL"
 
@@ -195,6 +191,91 @@ jobs:
               raise SystemExit('Cloud Run is not using live research')
           if not data.get('id'):
               raise SystemExit('live demo returned no venture id')
+          PY
+
+      - name: Browser smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ steps.service.outputs.url }}"
+          VENTURE_ID="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path('/tmp/cogen-live-demo.json').read_text())['id'])
+          PY
+          )"
+          docker run --rm -i \
+            -e BASE_URL="$URL" \
+            -e VENTURE_ID="$VENTURE_ID" \
+            --entrypoint python \
+            "${{ steps.image.outputs.uri }}" - <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          base = os.environ['BASE_URL'].rstrip('/')
+          venture_id = os.environ['VENTURE_ID']
+          console_errors = []
+          bad_same_origin = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
+              page = browser.new_page(viewport={"width": 1440, "height": 1000})
+              page.on('console', lambda m: console_errors.append(m.text) if m.type == 'error' else None)
+              page.on('response', lambda r: bad_same_origin.append((r.status, r.url))
+                      if r.url.startswith(base) and r.status >= 400 else None)
+
+              page.goto(base + '/', wait_until='networkidle', timeout=60000)
+              assert page.title() == 'Cogen — Venture Twin', page.title()
+              assert page.locator('h1', has_text='Ventures').is_visible()
+              assert page.get_by_role('button', name='Load demo').is_visible()
+              assert page.get_by_role('link', name='New venture').is_visible()
+              print('BROWSER_INDEX_PASS')
+
+              page.goto(f'{base}/#/v/{venture_id}/position', wait_until='networkidle', timeout=60000)
+              assert page.locator('.hero').is_visible()
+              assert page.get_by_text('Blindspots', exact=True).is_visible()
+              print('BROWSER_POSITION_PASS')
+
+              checks = [
+                  ('agent', '.composer-input', None),
+                  ('model', None, 'Assumption'),
+                  ('evidence', None, 'Admitted evidence'),
+                  ('sandbox', None, 'Scenario runs'),
+                  ('roadmap', None, 'Execution gates'),
+                  ('forks', None, 'Existing forks'),
+              ]
+              for tab, selector, text in checks:
+                  page.goto(f'{base}/#/v/{venture_id}/{tab}', wait_until='networkidle', timeout=60000)
+                  if selector:
+                      assert page.locator(selector).is_visible(), tab
+                  if text:
+                      assert page.get_by_text(text, exact=True).first.is_visible(), tab
+                  print(f'BROWSER_{tab.upper()}_PASS')
+
+              page.goto(base + '/#/new', wait_until='networkidle', timeout=60000)
+              page.locator('textarea').fill('Open a small neighborhood bakery')
+              page.locator('input').fill('bakery retail')
+              page.get_by_role('button', name='Begin').click()
+              page.wait_for_selector('.qcard input', timeout=30000)
+              assert page.get_by_role('button', name='Continue').is_visible()
+              print('BROWSER_INTAKE_PASS')
+
+              page.goto(base + '/', wait_until='networkidle', timeout=60000)
+              before = page.locator('html').get_attribute('data-theme')
+              page.locator('#theme').click()
+              after = page.locator('html').get_attribute('data-theme')
+              assert before != after
+              print('BROWSER_THEME_PASS')
+
+              browser.close()
+
+          if bad_same_origin:
+              print('BAD_SAME_ORIGIN_RESPONSES=', bad_same_origin)
+              raise SystemExit('same-origin browser requests returned HTTP errors')
+          if console_errors:
+              print('CONSOLE_ERRORS=', console_errors)
+              raise SystemExit('browser console emitted errors')
+          print('BROWSER_UI_E2E_PASS')
           PY
 
       - name: Final deployment URL
