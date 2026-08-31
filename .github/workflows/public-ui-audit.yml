@@ -1,0 +1,73 @@
+name: public-cloud-run-ui-audit
+
+on:
+  push:
+    paths:
+      - .github/workflows/public-ui-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      CANONICAL: https://cogen-257066508186.us-central1.run.app
+      LEGACY: https://cogen-txdv45ppua-uc.a.run.app
+      VENTURE_ID: 7d3382bc-070a-4be6-a68c-ded329893c4d
+    steps:
+      - name: Resolve public endpoint
+        id: public
+        run: |
+          set -euo pipefail
+          URL=""
+          for candidate in "$CANONICAL" "$LEGACY"; do
+            code="$(curl -sS -o /tmp/health.json -w '%{http_code}' --connect-timeout 10 --max-time 30 "$candidate/healthz" || true)"
+            echo "$candidate/healthz -> HTTP $code"
+            if [ "$code" = 200 ]; then
+              URL="$candidate"
+              cat /tmp/health.json; echo
+              break
+            fi
+          done
+          if [ -z "$URL" ]; then
+            echo 'PUBLIC_CLOUD_RUN_FAIL'
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "PUBLIC_CLOUD_RUN_PASS=$URL"
+
+      - name: Browser audit public app
+        env:
+          BASE_URL: ${{ steps.public.outputs.url }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet playwright==1.62.0
+          python -m playwright install --with-deps chromium >/dev/null
+          python - <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+          base=os.environ['BASE_URL'].rstrip('/')
+          vid=os.environ['VENTURE_ID']
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True)
+              page=browser.new_page(viewport={'width':1440,'height':1000})
+              errors=[]
+              page.on('console',lambda m: errors.append(m.text) if m.type=='error' else None)
+              page.goto(base+'/',wait_until='networkidle',timeout=60000)
+              page.locator('h1',has_text='Ventures').wait_for(state='visible',timeout=30000)
+              print('PUBLIC_UI_DASHBOARD_PASS')
+              page.goto(f'{base}/#/v/{vid}/position',wait_until='commit',timeout=60000)
+              page.locator('.hero').first.wait_for(state='visible',timeout=30000)
+              page.get_by_text('Blindspots',exact=True).first.wait_for(state='visible',timeout=30000)
+              print('PUBLIC_UI_POSITION_PASS')
+              page.goto(f'{base}/#/v/{vid}/agent',wait_until='commit',timeout=60000)
+              page.locator('.composer-input').first.wait_for(state='visible',timeout=30000)
+              print('PUBLIC_UI_AGENT_PASS')
+              browser.close()
+          if errors:
+              print('CONSOLE_ERRORS=',errors)
+              raise SystemExit(1)
+          print('PUBLIC_BROWSER_E2E_PASS')
+          PY
