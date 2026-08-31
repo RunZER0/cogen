@@ -46,14 +46,23 @@ jobs:
             --region="$GCP_REGION" \
             --update-env-vars=GEMINI_MODEL=gemini-3.7-flash \
             --quiet
-          MODEL="$(gcloud run services describe "$SERVICE_NAME" \
+          gcloud run services describe "$SERVICE_NAME" \
             --project="$GCP_PROJECT_ID" \
             --region="$GCP_REGION" \
-            --format='value(spec.template.spec.containers[0].env[?name=GEMINI_MODEL].value)')"
-          REVISION="$(gcloud run services describe "$SERVICE_NAME" \
-            --project="$GCP_PROJECT_ID" \
-            --region="$GCP_REGION" \
-            --format='value(status.latestReadyRevisionName)')"
+            --format=json >/tmp/service.json
+          MODEL="$(python - <<'PY'
+          import json
+          data=json.load(open('/tmp/service.json'))
+          env=data['spec']['template']['spec']['containers'][0].get('env',[])
+          print(next((item.get('value','') for item in env if item.get('name')=='GEMINI_MODEL'),''))
+          PY
+          )"
+          REVISION="$(python - <<'PY'
+          import json
+          data=json.load(open('/tmp/service.json'))
+          print(data.get('status',{}).get('latestReadyRevisionName',''))
+          PY
+          )"
           echo "PRODUCTION_MODEL=$MODEL"
           echo "REVISION=$REVISION"
           test "$MODEL" = "gemini-3.7-flash"
