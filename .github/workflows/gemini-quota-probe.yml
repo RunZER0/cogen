@@ -1,0 +1,49 @@
+name: gemini-quota-probe
+
+on:
+  push:
+    paths:
+      - .github/workflows/gemini-quota-probe.yml
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe eligible Gemini models
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          : "${GEMINI_API_KEY:?missing GEMINI_API_KEY}"
+          ok=0
+          for model in gemini-3.5-flash gemini-3.5-flash-lite gemini-3.1-flash-lite; do
+            code="$(curl -sS --max-time 30 \
+              -o "/tmp/${model}.json" -w '%{http_code}' \
+              -X POST "https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}" \
+              -H 'Content-Type: application/json' \
+              -d '{"contents":[{"parts":[{"text":"Reply with only OK"}]}]}')"
+            echo "${model} -> HTTP ${code}"
+            if [ "$code" = "200" ]; then
+              ok=1
+              python - "$model" "/tmp/${model}.json" <<'PY'
+          import json,sys
+          model,path=sys.argv[1:]
+          d=json.load(open(path))
+          text=''.join(p.get('text','') for c in d.get('candidates',[]) for p in c.get('content',{}).get('parts',[]))
+          print(model,'response=',text[:120])
+          PY
+            else
+              python - "$model" "/tmp/${model}.json" <<'PY'
+          import json,sys
+          model,path=sys.argv[1:]
+          try:
+              d=json.load(open(path))
+              e=d.get('error',{})
+              print(model,'error=',e.get('status'),e.get('message'))
+          except Exception:
+              print(open(path).read()[:500])
+          PY
+            fi
+          done
+          test "$ok" = 1
