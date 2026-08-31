@@ -1,0 +1,67 @@
+name: fix-cloud-run-public-endpoint
+
+on:
+  push:
+    paths:
+      - .github/workflows/fix-cloud-run-endpoint.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE_NAME: cogen
+  GCP_PROJECT_ID: cogen-506607
+  GCP_PROJECT_NUMBER: "257066508186"
+  GCP_REGION: us-central1
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/257066508186/locations/global/workloadIdentityPools/github/providers/cogen-github
+  GCP_SERVICE_ACCOUNT: cogen-github-deployer@cogen-506607.iam.gserviceaccount.com
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Install gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Force public default endpoint and verify
+        run: |
+          set -euo pipefail
+          gcloud run services update "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --default-url \
+            --ingress=all \
+            --no-invoker-iam-check \
+            --quiet
+          gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --member=allUsers --role=roles/run.invoker --quiet || true
+          echo '--- SERVICE NETWORK STATE ---'
+          gcloud run services describe "$SERVICE_NAME" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format='yaml(metadata.annotations,status.url,status.address,status.latestReadyRevisionName,status.traffic)'
+          CANONICAL="https://${SERVICE_NAME}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
+          LEGACY="$(gcloud run services describe "$SERVICE_NAME" --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --format='value(status.url)')"
+          for attempt in $(seq 1 10); do
+            for URL in "$CANONICAL" "$LEGACY"; do
+              code="$(curl -sS -o /tmp/health.json -w '%{http_code}' --connect-timeout 10 --max-time 30 "$URL/healthz" || true)"
+              echo "attempt=$attempt $URL/healthz -> HTTP $code"
+              if [ "$code" = 200 ]; then
+                cat /tmp/health.json; echo
+                echo "PUBLIC_CLOUD_RUN_FIXED=$URL"
+                exit 0
+              fi
+            done
+            sleep 3
+          done
+          echo 'PUBLIC_CLOUD_RUN_STILL_404'
+          exit 1
