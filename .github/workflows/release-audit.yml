@@ -1,0 +1,241 @@
+name: release-audit
+
+on:
+  push:
+    paths:
+      - .github/workflows/release-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: cogen-506607
+  GCP_REGION: us-central1
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/257066508186/locations/global/workloadIdentityPools/github/providers/cogen-github
+  GCP_SERVICE_ACCOUNT: cogen-github-deployer@cogen-506607.iam.gserviceaccount.com
+  # Exact image that was successfully deployed as Cloud Run revision cogen-00009-vnv.
+  AUDIT_IMAGE: us-central1-docker.pkg.dev/cogen-506607/cogen/cogen:96794badba3d42f065f01c9d54a40dc660bd0438
+
+jobs:
+  production-image-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Install gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Pull exact deployed image
+        run: |
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          docker pull "$AUDIT_IMAGE"
+
+      - name: Start production image locally with real Gemini + Neon
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          docker run -d --name cogen-audit --network host \
+            -e APP_ENV=production \
+            -e DATABASE_BACKEND=postgres \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e GEMINI_API_KEY="$GEMINI_API_KEY" \
+            -e GOOGLE_API_KEY="$GEMINI_API_KEY" \
+            -e GOOGLE_GENAI_USE_VERTEXAI=false \
+            -e GEMINI_MODEL=gemini-3.7-flash \
+            -e RESEARCH_PROVIDER=gemini \
+            -e RESEARCH_MODE=live \
+            -e SPECIALIST_MODE=orchestrated \
+            -e GOOGLE_CLOUD_PROJECT="$GCP_PROJECT_ID" \
+            -e GOOGLE_CLOUD_LOCATION="$GCP_REGION" \
+            "$AUDIT_IMAGE"
+
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8080/healthz >/tmp/health.json; then
+              cat /tmp/health.json; echo
+              break
+            fi
+            if [ "$i" = 30 ]; then
+              docker logs cogen-audit
+              exit 1
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8080/readyz | tee /tmp/ready.json
+          echo
+
+      - name: Live Gemini + Neon underwriting audit
+        id: live
+        run: |
+          set -euo pipefail
+          URL=http://127.0.0.1:8080
+          cat >/tmp/intake.json <<'JSON'
+          {
+            "idea":"Open a neighbourhood supermarket/minimart",
+            "business_type":"supermarket retail",
+            "location":"Ruiru, Kiambu County, Kenya",
+            "locality":"Ruiru",
+            "subdivision":"Kiambu County",
+            "country":"Kenya",
+            "currency":"KES",
+            "locale":"en-KE",
+            "launch_target_months":4,
+            "founder":{
+              "available_capital":1800000,
+              "protected_reserve":150000,
+              "debt_available":0,
+              "target_monthly_owner_income":120000,
+              "max_acceptable_loss":600000,
+              "time_commitment":"full-time",
+              "experience":"release audit"
+            }
+          }
+          JSON
+          curl --fail --silent --show-error -X POST "$URL/api/ventures" \
+            -H 'Content-Type: application/json' --data-binary @/tmp/intake.json -o /tmp/created.json
+          VENTURE_ID="$(python - <<'PY'
+          import json
+          print(json.load(open('/tmp/created.json'))['id'])
+          PY
+          )"
+          echo "venture_id=$VENTURE_ID" >> "$GITHUB_OUTPUT"
+          echo "VENTURE_ID=$VENTURE_ID"
+
+          curl --fail --silent --show-error --max-time 290 \
+            -X POST "$URL/api/ventures/$VENTURE_ID/analysis/sync" -o /tmp/analysis.json
+          python - <<'PY'
+          import json
+          ready=json.load(open('/tmp/ready.json'))
+          data=json.load(open('/tmp/analysis.json'))
+          uw=data.get('underwriting') or {}
+          print('PRODUCTION_IMAGE_LIVE_E2E_PASS')
+          print('database_backend=',ready.get('database_backend'))
+          print('research_mode=',ready.get('research_mode'))
+          print('research_provider=',ready.get('research_provider'))
+          print('decision=',uw.get('decision'))
+          print('evidence_count=',len(data.get('evidence') or []))
+          print('simulation_runs=',uw.get('simulation_runs'))
+          assert ready.get('database_backend') == 'postgres'
+          assert ready.get('research_mode') == 'live'
+          assert data.get('id')
+          assert data.get('evidence')
+          assert int(uw.get('simulation_runs') or 0) > 0
+          PY
+
+          for suffix in specialists validation events timeline subagents forks contradictions narrative todos; do
+            curl --fail --silent --show-error "$URL/api/ventures/$VENTURE_ID/$suffix" -o "/tmp/$suffix.json"
+            echo "API_${suffix^^}_PASS"
+          done
+
+          curl --fail --silent --show-error -X POST "$URL/api/ventures/$VENTURE_ID/sandbox" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"Audit rent shock","shocks":{"monthly_rent":90000},"simulation_runs":500}' \
+            -o /tmp/sandbox.json
+          echo API_SANDBOX_PASS
+
+      - name: Live Google ADK conversation audit
+        run: |
+          set -euo pipefail
+          URL=http://127.0.0.1:8080
+          VENTURE_ID="${{ steps.live.outputs.venture_id }}"
+          curl --fail --silent --show-error --no-buffer --max-time 180 \
+            -X POST "$URL/api/ventures/$VENTURE_ID/agent/message" \
+            -H 'Content-Type: application/json' \
+            -d '{"message":"Use inspect_venture now, then tell me the current decision in one concise sentence. Do not start new research."}' \
+            -o /tmp/agent-sse.txt
+          cat /tmp/agent-sse.txt
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"final"' /tmp/agent-sse.txt
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"done"' /tmp/agent-sse.txt
+          echo LIVE_ADK_AGENT_PASS
+
+      - name: Headless Chromium UI audit
+        run: |
+          set -euo pipefail
+          docker run --rm -i --network host \
+            -e BASE_URL=http://127.0.0.1:8080 \
+            -e VENTURE_ID="${{ steps.live.outputs.venture_id }}" \
+            --entrypoint python "$AUDIT_IMAGE" - <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          base=os.environ['BASE_URL']
+          vid=os.environ['VENTURE_ID']
+          console_errors=[]
+          http_errors=[]
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,args=['--no-sandbox'])
+              page=browser.new_page(viewport={'width':1440,'height':1000})
+              page.on('console',lambda m: console_errors.append(m.text) if m.type=='error' else None)
+              page.on('response',lambda r: http_errors.append((r.status,r.url)) if r.url.startswith(base) and r.status>=400 else None)
+
+              page.goto(base+'/',wait_until='networkidle',timeout=60000)
+              assert page.title()=='Cogen — Venture Twin'
+              assert page.locator('h1',has_text='Ventures').is_visible()
+              assert page.get_by_role('button',name='Load demo').is_visible()
+              assert page.get_by_role('link',name='New venture').is_visible()
+              print('UI_DASHBOARD_PASS')
+
+              checks=[
+                ('position','.hero','Blindspots'),
+                ('agent','.composer-input',None),
+                ('model',None,'Assumption'),
+                ('evidence',None,'Admitted evidence'),
+                ('sandbox',None,'Scenario runs'),
+                ('roadmap',None,'Execution gates'),
+                ('forks',None,'Existing forks')]
+              for tab,selector,text in checks:
+                  page.goto(f'{base}/#/v/{vid}/{tab}',wait_until='networkidle',timeout=60000)
+                  if selector: assert page.locator(selector).first.is_visible(),tab
+                  if text: assert page.get_by_text(text,exact=True).first.is_visible(),tab
+                  print('UI_'+tab.upper()+'_PASS')
+
+              page.goto(base+'/#/new',wait_until='networkidle',timeout=60000)
+              page.locator('textarea').fill('Open a small neighborhood bakery')
+              page.locator('input').fill('bakery retail')
+              page.get_by_role('button',name='Begin').click()
+              page.wait_for_selector('.qcard input',timeout=30000)
+              assert page.get_by_role('button',name='Continue').is_visible()
+              print('UI_INTAKE_PASS')
+
+              page.goto(base+'/',wait_until='networkidle',timeout=60000)
+              before=page.locator('html').get_attribute('data-theme')
+              page.locator('#theme').click()
+              after=page.locator('html').get_attribute('data-theme')
+              assert before!=after
+              print('UI_THEME_PASS')
+
+              mobile=browser.new_page(viewport={'width':390,'height':844})
+              mobile.goto(base+'/',wait_until='networkidle',timeout=60000)
+              assert mobile.get_by_role('button',name='Load demo').is_visible()
+              assert mobile.get_by_role('link',name='New venture').is_visible()
+              print('UI_MOBILE_PASS')
+              browser.close()
+
+          if http_errors:
+              print('HTTP_ERRORS=',http_errors)
+              raise SystemExit('browser saw same-origin HTTP errors')
+          if console_errors:
+              print('CONSOLE_ERRORS=',console_errors)
+              raise SystemExit('browser console errors')
+          print('PRODUCTION_IMAGE_BROWSER_E2E_PASS')
+          PY
+
+      - name: Container logs
+        if: always()
+        run: docker logs cogen-audit || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f cogen-audit || true
