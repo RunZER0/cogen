@@ -1,0 +1,228 @@
+name: vertex-production-e2e
+
+on:
+  push:
+    paths:
+      - .github/workflows/vertex-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: cogen-506607
+  GCP_REGION: us-central1
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/257066508186/locations/global/workloadIdentityPools/github/providers/cogen-github
+  GCP_SERVICE_ACCOUNT: cogen-github-deployer@cogen-506607.iam.gserviceaccount.com
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: production
+      DATABASE_BACKEND: postgres
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      GOOGLE_CLOUD_PROJECT: cogen-506607
+      GOOGLE_CLOUD_LOCATION: us-central1
+      GEMINI_MODEL: gemini-3.7-flash
+      RESEARCH_PROVIDER: gemini
+      RESEARCH_MODE: live
+      SPECIALIST_MODE: orchestrated
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Install gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Prepare Vertex access and application
+        run: |
+          set -euo pipefail
+          gcloud services enable aiplatform.googleapis.com --project="$GCP_PROJECT_ID" --quiet
+          gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+            --member="serviceAccount:$GCP_SERVICE_ACCOUNT" \
+            --role="roles/aiplatform.user" \
+            --condition=None \
+            --quiet
+          uv sync --extra dev --python 3.13
+          uv run playwright install --with-deps chromium
+          uv run ruff check app tests
+          uv run pytest
+      - name: Start production-configured app
+        run: |
+          set -euo pipefail
+          nohup uv run uvicorn app.main:app --host 127.0.0.1 --port 8080 >/tmp/cogen.log 2>&1 &
+          echo $! >/tmp/cogen.pid
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8080/readyz >/tmp/ready.json; then
+              cat /tmp/ready.json; echo
+              break
+            fi
+            if [ "$i" = 40 ]; then
+              cat /tmp/cogen.log
+              exit 1
+            fi
+            sleep 2
+          done
+          python - <<'PY'
+          import json
+          data=json.load(open('/tmp/ready.json'))
+          assert data['database_backend']=='postgres', data
+          assert data['database']=='ok', data
+          assert data['research_mode']=='live', data
+          assert data['research_provider']=='gemini', data
+          print('VERTEX_READY_PASS')
+          PY
+      - name: Live Vertex Gemini underwriting
+        id: live
+        run: |
+          set -euo pipefail
+          cat >/tmp/intake.json <<'JSON'
+          {
+            "idea":"Open a neighbourhood supermarket/minimart",
+            "business_type":"supermarket retail",
+            "location":"Ruiru, Kiambu County, Kenya",
+            "locality":"Ruiru",
+            "subdivision":"Kiambu County",
+            "country":"Kenya",
+            "currency":"KES",
+            "locale":"en-KE",
+            "launch_target_months":4,
+            "founder":{
+              "available_capital":1800000,
+              "protected_reserve":150000,
+              "debt_available":0,
+              "target_monthly_owner_income":120000,
+              "max_acceptable_loss":600000,
+              "time_commitment":"full-time",
+              "experience":"Vertex release E2E"
+            }
+          }
+          JSON
+          curl -fsS -X POST http://127.0.0.1:8080/api/ventures \
+            -H 'Content-Type: application/json' --data-binary @/tmp/intake.json -o /tmp/created.json
+          VID="$(python -c "import json; print(json.load(open('/tmp/created.json'))['id'])")"
+          echo "venture_id=$VID" >> "$GITHUB_OUTPUT"
+          CODE="$(curl -sS --max-time 290 -X POST "http://127.0.0.1:8080/api/ventures/$VID/analysis/sync" -o /tmp/analysis.json -w '%{http_code}' || true)"
+          echo "ANALYSIS_HTTP_CODE=$CODE"
+          if [ "$CODE" != "200" ]; then
+            cat /tmp/analysis.json || true
+            echo
+            cat /tmp/cogen.log
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          data=json.load(open('/tmp/analysis.json'))
+          uw=data.get('underwriting') or {}
+          print('VERTEX_GEMINI_E2E_PASS')
+          print('venture_id=',data.get('id'))
+          print('decision=',uw.get('decision'))
+          print('evidence_count=',len(data.get('evidence') or []))
+          print('simulation_runs=',uw.get('simulation_runs'))
+          assert data.get('id')
+          assert data.get('evidence')
+          assert int(uw.get('simulation_runs') or 0)>0
+          PY
+          for suffix in specialists validation events timeline subagents forks contradictions narrative todos; do
+            curl -fsS "http://127.0.0.1:8080/api/ventures/$VID/$suffix" -o "/tmp/$suffix.json"
+            echo "API_${suffix^^}_PASS"
+          done
+          curl -fsS -X POST "http://127.0.0.1:8080/api/ventures/$VID/sandbox" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"Audit rent shock","shocks":{"monthly_rent":90000},"simulation_runs":500}' \
+            -o /tmp/sandbox.json
+          echo API_SANDBOX_PASS
+      - name: Live Google ADK conversation
+        run: |
+          set -euo pipefail
+          VID="${{ steps.live.outputs.venture_id }}"
+          curl -fsS --no-buffer --max-time 180 \
+            -X POST "http://127.0.0.1:8080/api/ventures/$VID/agent/message" \
+            -H 'Content-Type: application/json' \
+            -d '{"message":"Use inspect_venture now, then tell me the current decision in one concise sentence. Do not start new research."}' \
+            -o /tmp/agent-sse.txt
+          cat /tmp/agent-sse.txt
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"final"' /tmp/agent-sse.txt
+          grep -Eq '"type"[[:space:]]*:[[:space:]]*"done"' /tmp/agent-sse.txt
+          echo VERTEX_ADK_AGENT_PASS
+      - name: Chromium UI audit
+        run: |
+          set -euo pipefail
+          VID="${{ steps.live.outputs.venture_id }}" uv run python - <<'PY'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          base='http://127.0.0.1:8080'
+          vid=os.environ['VID']
+          console_errors=[]
+          http_errors=[]
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True,args=['--no-sandbox'])
+              page=browser.new_page(viewport={'width':1440,'height':1000})
+              page.on('console',lambda m: console_errors.append(m.text) if m.type=='error' else None)
+              page.on('response',lambda r: http_errors.append((r.status,r.url)) if r.url.startswith(base) and r.status>=400 else None)
+              page.goto(base+'/',wait_until='networkidle',timeout=60000)
+              assert page.title()=='Cogen — Venture Twin'
+              assert page.locator('h1',has_text='Ventures').is_visible()
+              assert page.get_by_role('button',name='Load demo').is_visible()
+              assert page.get_by_role('link',name='New venture').is_visible()
+              print('UI_DASHBOARD_PASS')
+              checks=[
+                  ('position','.hero','Blindspots'),
+                  ('agent','.composer-input',None),
+                  ('model',None,'Assumption'),
+                  ('evidence',None,'Admitted evidence'),
+                  ('sandbox',None,'Scenario runs'),
+                  ('roadmap',None,'Execution gates'),
+                  ('forks',None,'Existing forks'),
+              ]
+              for tab,selector,text in checks:
+                  page.goto(f'{base}/#/v/{vid}/{tab}',wait_until='networkidle',timeout=60000)
+                  if selector: assert page.locator(selector).first.is_visible(),tab
+                  if text: assert page.get_by_text(text,exact=True).first.is_visible(),tab
+                  print('UI_'+tab.upper()+'_PASS')
+              page.goto(base+'/#/new',wait_until='networkidle',timeout=60000)
+              page.locator('textarea').fill('Open a small neighborhood bakery')
+              page.locator('input').fill('bakery retail')
+              page.get_by_role('button',name='Begin').click()
+              page.wait_for_selector('.qcard input',timeout=30000)
+              assert page.get_by_role('button',name='Continue').is_visible()
+              print('UI_INTAKE_PASS')
+              page.goto(base+'/',wait_until='networkidle',timeout=60000)
+              before=page.locator('html').get_attribute('data-theme')
+              page.locator('#theme').click()
+              after=page.locator('html').get_attribute('data-theme')
+              assert before!=after
+              print('UI_THEME_PASS')
+              mobile=browser.new_page(viewport={'width':390,'height':844})
+              mobile.goto(base+'/',wait_until='networkidle',timeout=60000)
+              assert mobile.get_by_role('button',name='Load demo').is_visible()
+              assert mobile.get_by_role('link',name='New venture').is_visible()
+              print('UI_MOBILE_PASS')
+              browser.close()
+          if http_errors:
+              print('HTTP_ERRORS=',http_errors)
+              raise SystemExit('browser saw same-origin HTTP errors')
+          if console_errors:
+              print('CONSOLE_ERRORS=',console_errors)
+              raise SystemExit('browser console errors')
+          print('VERTEX_BROWSER_E2E_PASS')
+          PY
+      - name: Logs
+        if: always()
+        run: cat /tmp/cogen.log || true
+      - name: Stop app
+        if: always()
+        run: test ! -f /tmp/cogen.pid || kill "$(cat /tmp/cogen.pid)" || true
