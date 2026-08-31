@@ -5,6 +5,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Only the newest main revision should be allowed to reach Cloud Run. Without this, two quick
+# pushes can finish out of order and an older image can overwrite the newer deployment.
+concurrency:
+  group: cogen-cloud-run-main
+  cancel-in-progress: true
+
 permissions:
   contents: read
   id-token: write
@@ -97,6 +103,9 @@ jobs:
               "GEMINI_MODEL": "gemini-3.7-flash",
               "RESEARCH_PROVIDER": "gemini",
               "RESEARCH_MODE": "live",
+              # The production fallback is intentional: agentic specialist mode additionally
+              # requires Tavily. The founder-facing Google ADK root agent remains live either way.
+              "SPECIALIST_MODE": "orchestrated",
               "GOOGLE_CLOUD_PROJECT": os.environ["GCP_PROJECT_ID"],
               "GOOGLE_CLOUD_LOCATION": os.environ["GCP_REGION"],
           }
@@ -115,6 +124,7 @@ jobs:
             --no-invoker-iam-check \
             --ingress=all \
             --default-url \
+            --no-cpu-throttling \
             --min-instances=0 \
             --max-instances=3 \
             --cpu=1 \
@@ -124,8 +134,8 @@ jobs:
             --env-vars-file=/tmp/cogen-env.yaml \
             --quiet
 
-          # Keep the legacy public binding too. The disabled invoker check is the current
-          # Google-recommended public-access mechanism and also works under domain restrictions.
+          # Keep the legacy binding for compatibility. Disabling the invoker check above is the
+          # current Google-recommended public-access mechanism and also survives domain restrictions.
           gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
             --project="$GCP_PROJECT_ID" \
             --region="$GCP_REGION" \
@@ -154,7 +164,7 @@ jobs:
           for candidate in "$CANONICAL" "$LEGACY"; do
             [ -n "$candidate" ] || continue
             echo "Probing $candidate"
-            for attempt in $(seq 1 6); do
+            for attempt in $(seq 1 8); do
               code="$(curl --silent --output /tmp/health.json --write-out '%{http_code}' \
                 --connect-timeout 10 --max-time 30 "$candidate/healthz" || true)"
               echo "health attempt $attempt -> $code"
@@ -179,15 +189,54 @@ jobs:
           cat /tmp/ready.json
           echo
 
-      - name: Run deployed canonical demo
+      - name: Run deployed live Gemini + Postgres E2E
+        id: live
         shell: bash
         run: |
           set -euo pipefail
           URL="${{ steps.service.outputs.url }}"
-          curl --fail --silent --show-error \
-            --max-time 290 \
-            -X POST "$URL/api/demo" \
+          cat >/tmp/cogen-intake.json <<'JSON'
+          {
+            "idea": "Open a neighbourhood supermarket/minimart",
+            "business_type": "supermarket retail",
+            "location": "Ruiru, Kiambu County, Kenya",
+            "locality": "Ruiru",
+            "subdivision": "Kiambu County",
+            "country": "Kenya",
+            "currency": "KES",
+            "locale": "en-KE",
+            "launch_target_months": 4,
+            "founder": {
+              "available_capital": 1800000,
+              "protected_reserve": 150000,
+              "debt_available": 0,
+              "target_monthly_owner_income": 120000,
+              "max_acceptable_loss": 600000,
+              "time_commitment": "full-time",
+              "experience": "release-audit retail founder"
+            }
+          }
+          JSON
+
+          curl --fail --silent --show-error --max-time 30 \
+            -X POST "$URL/api/ventures" \
             -H 'Content-Type: application/json' \
+            --data-binary @/tmp/cogen-intake.json \
+            -o /tmp/cogen-created.json
+
+          VENTURE_ID="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path('/tmp/cogen-created.json').read_text())['id'])
+          PY
+          )"
+          echo "venture_id=$VENTURE_ID" >> "$GITHUB_OUTPUT"
+          echo "LIVE_VENTURE_ID=$VENTURE_ID"
+
+          # This endpoint keeps the Cloud Run request open until real live research, evidence
+          # admission and the deterministic 5,000-run underwriting simulation have completed.
+          curl --fail --silent --show-error --max-time 290 \
+            -X POST "$URL/api/ventures/$VENTURE_ID/analysis/sync" \
             -o /tmp/cogen-live-demo.json
 
           python - <<'PY'
@@ -200,28 +249,60 @@ jobs:
           print('CLOUD_RUN_E2E_PASS')
           print('database_backend=', ready.get('database_backend'))
           print('research_mode=', ready.get('research_mode'))
+          print('research_provider=', ready.get('research_provider'))
           print('venture_id=', data.get('id'))
           print('decision=', underwriting.get('decision'))
+          print('evidence_count=', len(data.get('evidence') or []))
           print('simulation_runs=', underwriting.get('simulation_runs'))
           if ready.get('database_backend') != 'postgres':
               raise SystemExit('Cloud Run is not using Postgres/Neon')
           if ready.get('research_mode') != 'live':
               raise SystemExit('Cloud Run is not using live research')
           if not data.get('id'):
-              raise SystemExit('live demo returned no venture id')
+              raise SystemExit('live analysis returned no venture id')
+          if not data.get('evidence'):
+              raise SystemExit('live analysis returned no admitted evidence')
+          if int(underwriting.get('simulation_runs') or 0) <= 0:
+              raise SystemExit('underwriting simulation did not run')
           PY
+
+          # Production persistence/read surfaces used by the UI must all work against the same
+          # live Postgres venture, not only in the SQLite unit suite.
+          for suffix in specialists validation events timeline subagents; do
+            curl --fail --silent --show-error --max-time 30 \
+              "$URL/api/ventures/$VENTURE_ID/$suffix" -o "/tmp/$suffix.json"
+            echo "LIVE_${suffix^^}_PASS"
+          done
+
+          curl --fail --silent --show-error --max-time 60 \
+            -X POST "$URL/api/ventures/$VENTURE_ID/sandbox" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"Release audit rent shock","shocks":{"monthly_rent":90000},"simulation_runs":500}' \
+            -o /tmp/sandbox.json
+          echo "LIVE_SANDBOX_PASS"
+
+      - name: Run live ADK conversation smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ steps.service.outputs.url }}"
+          VENTURE_ID="${{ steps.live.outputs.venture_id }}"
+          curl --fail --silent --show-error --no-buffer --max-time 180 \
+            -X POST "$URL/api/ventures/$VENTURE_ID/agent/message" \
+            -H 'Content-Type: application/json' \
+            -d '{"message":"Use inspect_venture now, then tell me the current decision in one concise sentence. Do not start new research."}' \
+            -o /tmp/agent-sse.txt
+          cat /tmp/agent-sse.txt
+          grep -q '"type": "final"\|"type":"final"' /tmp/agent-sse.txt
+          grep -q '"type": "done"\|"type":"done"' /tmp/agent-sse.txt
+          echo "LIVE_ADK_AGENT_PASS"
 
       - name: Browser smoke test
         shell: bash
         run: |
           set -euo pipefail
           URL="${{ steps.service.outputs.url }}"
-          VENTURE_ID="$(python - <<'PY'
-          import json
-          from pathlib import Path
-          print(json.loads(Path('/tmp/cogen-live-demo.json').read_text())['id'])
-          PY
-          )"
+          VENTURE_ID="${{ steps.live.outputs.venture_id }}"
           docker run --rm -i \
             -e BASE_URL="$URL" \
             -e VENTURE_ID="$VENTURE_ID" \
@@ -285,6 +366,12 @@ jobs:
               assert before != after
               print('BROWSER_THEME_PASS')
 
+              # A second viewport catches layout regressions that only show up on a phone-sized page.
+              mobile = browser.new_page(viewport={"width": 390, "height": 844})
+              mobile.goto(base + '/', wait_until='networkidle', timeout=60000)
+              assert mobile.get_by_role('button', name='Load demo').is_visible()
+              assert mobile.get_by_role('link', name='New venture').is_visible()
+              print('BROWSER_MOBILE_PASS')
               browser.close()
 
           if bad_same_origin:
@@ -302,4 +389,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f /tmp/cogen-env.yaml /tmp/health.json /tmp/ready.json /tmp/cogen-live-demo.json
+        run: rm -f /tmp/cogen-env.yaml /tmp/health.json /tmp/ready.json /tmp/cogen-intake.json /tmp/cogen-created.json /tmp/cogen-live-demo.json /tmp/agent-sse.txt /tmp/sandbox.json /tmp/specialists.json /tmp/validation.json /tmp/events.json /tmp/timeline.json /tmp/subagents.json
